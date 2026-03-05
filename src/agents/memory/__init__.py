@@ -7,6 +7,7 @@ from .session import (
     SessionABC,
     is_openai_responses_compaction_aware_session,
 )
+from .session_settings import SessionSettings
 from .sqlite_session import SQLiteSession
 from .util import SessionInputCallback
 
@@ -14,6 +15,7 @@ __all__ = [
     "Session",
     "SessionABC",
     "SessionInputCallback",
+    "SessionSettings",
     "SQLiteSession",
     "OpenAIConversationsSession",
     "OpenAIResponsesCompactionSession",

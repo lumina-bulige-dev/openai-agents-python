@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import inspect
 import json
+import weakref
 from collections.abc import Awaitable
-from dataclasses import dataclass, replace as dataclasses_replace
+from dataclasses import dataclass, field, replace as dataclasses_replace
 from typing import TYPE_CHECKING, Any, Callable, Generic, cast, overload
 
 from pydantic import TypeAdapter
@@ -62,6 +63,13 @@ class HandoffInputData:
     later on, it is optional for backwards compatibility.
     """
 
+    input_items: tuple[RunItem, ...] | None = None
+    """
+    Items to include in the next agent's input. When set, these items are used instead of
+    new_items for building the input to the next agent. This allows filtering duplicates
+    from agent input while preserving all items in new_items for session history.
+    """
+
     def clone(self, **kwargs: Any) -> HandoffInputData:
         """
         Make a copy of the handoff input data, with the given arguments changed. For example, you
@@ -98,7 +106,12 @@ class Handoff(Generic[TContext, TAgent]):
     """The description of the tool that represents the handoff."""
 
     input_json_schema: dict[str, Any]
-    """The JSON schema for the handoff input. Can be empty if the handoff does not take an input."""
+    """The JSON schema for the handoff tool-call arguments.
+
+    This schema is exposed to the model as the handoff tool's ``parameters``. It only describes the
+    structured payload passed to ``on_invoke_handoff`` and does not replace the next agent's main
+    input.
+    """
 
     on_invoke_handoff: Callable[[RunContextWrapper[Any], str], Awaitable[TAgent]]
     """The function that invokes the handoff.
@@ -117,10 +130,11 @@ class Handoff(Generic[TContext, TAgent]):
     filter inputs (for example, to remove older inputs or remove tools from existing inputs). The
     function receives the entire conversation history so far, including the input item that
     triggered the handoff and a tool call output item representing the handoff tool's output. You
-    are free to modify the input history or new items as you see fit. The next agent that runs will
-    receive ``handoff_input_data.all_items``. IMPORTANT: in streaming mode, we will not stream
-    anything as a result of this function. The items generated before will already have been
-    streamed.
+    are free to modify the input history or new items as you see fit. The next agent receives the
+    input history plus ``input_items`` when provided, otherwise it receives ``new_items``. Use
+    ``input_items`` to filter model input while keeping ``new_items`` intact for session history.
+    IMPORTANT: in streaming mode, we will not stream anything as a result of this function. The
+    items generated before will already have been streamed.
     """
 
     nest_handoff_history: bool | None = None
@@ -139,6 +153,11 @@ class Handoff(Generic[TContext, TAgent]):
     handoff is enabled. You can use this to dynamically enable or disable a handoff based on your
     context or state.
     """
+
+    _agent_ref: weakref.ReferenceType[AgentBase[Any]] | None = field(
+        default=None, init=False, repr=False
+    )
+    """Weak reference to the target agent when constructed via `handoff()`."""
 
     def get_transfer_message(self, agent: AgentBase[Any]) -> str:
         return json.dumps({"assistant": agent.name})
@@ -212,9 +231,13 @@ def handoff(
         tool_name_override: Optional override for the name of the tool that represents the handoff.
         tool_description_override: Optional override for the description of the tool that
             represents the handoff.
-        on_handoff: A function that runs when the handoff is invoked.
-        input_type: The type of the input to the handoff. If provided, the input will be validated
-            against this type. Only relevant if you pass a function that takes an input.
+        on_handoff: A function that runs when the handoff is invoked. The ``handoff()`` helper
+            always returns the specific ``agent`` captured here, so use ``on_handoff`` for side
+            effects or bookkeeping rather than dynamic destination selection.
+        input_type: The type of the handoff tool-call arguments. If provided, the model-generated
+            JSON arguments are validated against this type and the parsed value is passed to
+            ``on_handoff``. This only affects the handoff tool payload, not the next agent's main
+            input.
         input_filter: A function that filters the inputs that are passed to the next agent.
         nest_handoff_history: Optional override for the RunConfig-level ``nest_handoff_history``
             flag. If ``None`` we fall back to the run's configuration.
@@ -292,7 +315,7 @@ def handoff(
             return await result
         return bool(result)
 
-    return Handoff(
+    handoff_obj = Handoff(
         tool_name=tool_name,
         tool_description=tool_description,
         input_json_schema=input_json_schema,
@@ -302,6 +325,8 @@ def handoff(
         agent_name=agent.name,
         is_enabled=_is_enabled if callable(is_enabled) else is_enabled,
     )
+    handoff_obj._agent_ref = weakref.ref(agent)
+    return handoff_obj
 
 
 __all__ = [

@@ -38,6 +38,7 @@ class GenerateDynamicPromptData:
 
     context: RunContextWrapper[Any]
     """The run context."""
+ 
 
     agent: Agent[Any]
     """The agent for which the prompt is being generated."""

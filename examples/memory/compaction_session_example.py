@@ -45,12 +45,33 @@ async def main():
         result = await Runner.run(agent, prompt, session=session)
         print(f"Assistant: {result.final_output}\n")
 
-    # Show final session state
+    # Show session state after automatic compaction (if triggered)
     items = await session.get_items()
-    print("=== Final Session State ===")
+    print("=== Session State (Auto Compaction) ===")
     print(f"Total items: {len(items)}")
     for item in items:
         # Some inputs are stored as easy messages (only `role` and `content`).
+        item_type = item.get("type") or ("message" if "role" in item else "unknown")
+        if item_type == "compaction":
+            print("  - compaction (encrypted content)")
+        elif item_type == "message":
+            role = item.get("role", "unknown")
+            print(f"  - message ({role})")
+        else:
+            print(f"  - {item_type}")
+    print()
+
+    # Manual compaction after inspecting the auto-compacted state.
+    print("=== Manual Compaction ===")
+    await session.run_compaction({"force": True})
+    print("Done")
+    print()
+
+    # Show final session state after manual compaction
+    items = await session.get_items()
+    print("=== Session State (Manual Compaction) ===")
+    print(f"Total items: {len(items)}")
+    for item in items:
         item_type = item.get("type") or ("message" if "role" in item else "unknown")
         if item_type == "compaction":
             print("  - compaction (encrypted content)")

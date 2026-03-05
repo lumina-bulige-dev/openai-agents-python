@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 from typing_extensions import TypedDict, TypeGuard
 
 if TYPE_CHECKING:
     from ..items import TResponseInputItem
+    from .session_settings import SessionSettings
 
 
 @runtime_checkable
@@ -18,6 +19,7 @@ class Session(Protocol):
     """
 
     session_id: str
+    session_settings: SessionSettings | None = None
 
     async def get_items(self, limit: int | None = None) -> list[TResponseInputItem]:
         """Retrieve the conversation history for this session.
@@ -63,6 +65,7 @@ class SessionABC(ABC):
     """
 
     session_id: str
+    session_settings: SessionSettings | None = None
 
     @abstractmethod
     async def get_items(self, limit: int | None = None) -> list[TResponseInputItem]:
@@ -107,6 +110,20 @@ class OpenAIResponsesCompactionArgs(TypedDict, total=False):
     response_id: str
     """The ID of the last response to use for compaction."""
 
+    compaction_mode: Literal["previous_response_id", "input", "auto"]
+    """How to provide history for compaction.
+
+    - "auto": Use input when the last response was not stored or no response ID is available.
+    - "previous_response_id": Use server-managed response history.
+    - "input": Send locally stored session items as input.
+    """
+
+    store: bool
+    """Whether the last model response was stored on the server.
+
+    When set to False, compaction should avoid "previous_response_id" unless explicitly requested.
+    """
+
     force: bool
     """Whether to force compaction even if the threshold is not met."""
 
@@ -124,4 +141,10 @@ def is_openai_responses_compaction_aware_session(
     session: Session | None,
 ) -> TypeGuard[OpenAIResponsesCompactionAwareSession]:
     """Check if a session supports responses compaction."""
-    return isinstance(session, OpenAIResponsesCompactionAwareSession)
+    if session is None:
+        return False
+    try:
+        run_compaction = getattr(session, "run_compaction", None)
+    except Exception:
+        return False
+    return callable(run_compaction)

@@ -55,13 +55,14 @@ def apply_diff(input: str, diff: str, mode: ApplyDiffMode = "default") -> str:
     This parser understands both the create-file syntax (only "+" prefixed
     lines) and the default update syntax that includes context hunks.
     """
-
+    newline = _detect_newline(input, diff, mode)
     diff_lines = _normalize_diff_lines(diff)
     if mode == "create":
-        return _parse_create_diff(diff_lines)
+        return _parse_create_diff(diff_lines, newline=newline)
 
-    parsed = _parse_update_diff(diff_lines, input)
-    return _apply_chunks(input, parsed.chunks)
+    normalized_input = _normalize_text_newlines(input)
+    parsed = _parse_update_diff(diff_lines, normalized_input)
+    return _apply_chunks(normalized_input, parsed.chunks, newline=newline)
 
 
 def _normalize_diff_lines(diff: str) -> list[str]:
@@ -69,6 +70,23 @@ def _normalize_diff_lines(diff: str) -> list[str]:
     if lines and lines[-1] == "":
         lines.pop()
     return lines
+
+
+def _detect_newline_from_text(text: str) -> str:
+    return "\r\n" if "\r\n" in text else "\n"
+
+
+def _detect_newline(input: str, diff: str, mode: ApplyDiffMode) -> str:
+    # Create-file diffs don't have an input to infer newline style from.
+    # Use the diff's newline style if present, otherwise default to LF.
+    if mode != "create" and "\n" in input:
+        return _detect_newline_from_text(input)
+    return _detect_newline_from_text(diff)
+
+
+def _normalize_text_newlines(text: str) -> str:
+    # Normalize CRLF to LF for parsing/matching. Newline style is restored when emitting.
+    return text.replace("\r\n", "\n")
 
 
 def _is_done(state: ParserState, prefixes: Sequence[str]) -> bool:
@@ -89,7 +107,7 @@ def _read_str(state: ParserState, prefix: str) -> str:
     return ""
 
 
-def _parse_create_diff(lines: list[str]) -> str:
+def _parse_create_diff(lines: list[str], newline: str) -> str:
     parser = ParserState(lines=[*lines, END_PATCH])
     output: list[str] = []
 
@@ -102,7 +120,7 @@ def _parse_create_diff(lines: list[str]) -> str:
             raise ValueError(f"Invalid Add File Line: {line}")
         output.append(line[1:])
 
-    return "\n".join(output)
+    return newline.join(output)
 
 
 def _parse_update_diff(lines: list[str], input: str) -> ParsedUpdateDiff:
@@ -299,7 +317,7 @@ def _equals_slice(
     return True
 
 
-def _apply_chunks(input: str, chunks: list[Chunk]) -> str:
+def _apply_chunks(input: str, chunks: list[Chunk], newline: str) -> str:
     orig_lines = input.split("\n")
     dest_lines: list[str] = []
     cursor = 0
@@ -323,7 +341,7 @@ def _apply_chunks(input: str, chunks: list[Chunk]) -> str:
         cursor += len(chunk.del_lines)
 
     dest_lines.extend(orig_lines[cursor:])
-    return "\n".join(dest_lines)
+    return newline.join(dest_lines)
 
 
 __all__ = ["apply_diff"]

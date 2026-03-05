@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import abc
+import json
 import weakref
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generic, Literal, TypeVar, Union, cast
@@ -10,6 +11,7 @@ from openai.types.responses import (
     Response,
     ResponseComputerToolCall,
     ResponseFileSearchToolCall,
+    ResponseFunctionShellToolCallOutput,
     ResponseFunctionToolCall,
     ResponseFunctionWebSearch,
     ResponseInputItemParam,
@@ -55,6 +57,7 @@ from .tool import (
     ValidToolOutputPydanticModelsTypeAdapter,
 )
 from .usage import Usage
+from .util._json import _to_dump_compatible
 
 if TYPE_CHECKING:
     from .agent import Agent
@@ -244,11 +247,15 @@ class ToolCallItem(RunItemBase[Any]):
 
     type: Literal["tool_call_item"] = "tool_call_item"
 
+    description: str | None = None
+    """Optional tool description if known at item creation time."""
+
 
 ToolCallOutputTypes: TypeAlias = Union[
     FunctionCallOutput,
     ComputerCallOutput,
     LocalShellCallOutput,
+    ResponseFunctionShellToolCallOutput,
     dict[str, Any],
 ]
 
@@ -279,9 +286,19 @@ class ToolCallOutputItem(RunItemBase[Any]):
             payload = dict(self.raw_item)
             payload_type = payload.get("type")
             if payload_type == "shell_call_output":
+                payload = dict(payload)
                 payload.pop("status", None)
                 payload.pop("shell_output", None)
                 payload.pop("provider_data", None)
+                outputs = payload.get("output")
+                if isinstance(outputs, list):
+                    for entry in outputs:
+                        if not isinstance(entry, dict):
+                            continue
+                        outcome = entry.get("outcome")
+                        if isinstance(outcome, dict):
+                            if outcome.get("type") == "exit":
+                                entry["outcome"] = outcome
             return cast(TResponseInputItem, payload)
 
         return super().to_input_item()
@@ -338,17 +355,115 @@ class CompactionItem(RunItemBase[TResponseInputItem]):
         return self.raw_item
 
 
+# Union type for tool approval raw items - supports function tools, hosted tools, shell tools, etc.
+ToolApprovalRawItem: TypeAlias = Union[
+    ResponseFunctionToolCall,
+    McpCall,
+    McpApprovalRequest,
+    LocalShellCall,
+    dict[str, Any],  # For flexibility with other tool types
+]
+
+
+@dataclass
+class ToolApprovalItem(RunItemBase[Any]):
+    """Tool call that requires approval before execution."""
+
+    raw_item: ToolApprovalRawItem
+    """Raw tool call awaiting approval (function, hosted, shell, etc.)."""
+
+    tool_name: str | None = None
+    """Tool name for approval tracking; falls back to raw_item.name when absent."""
+
+    type: Literal["tool_approval_item"] = "tool_approval_item"
+
+    def __post_init__(self) -> None:
+        """Populate tool_name from the raw item if not provided."""
+        if self.tool_name is None:
+            # Extract name from raw_item - handle different types
+            if isinstance(self.raw_item, dict):
+                self.tool_name = self.raw_item.get("name")
+            elif hasattr(self.raw_item, "name"):
+                self.tool_name = self.raw_item.name
+            else:
+                self.tool_name = None
+
+    def __hash__(self) -> int:
+        """Hash by object identity to keep distinct approvals separate."""
+        return object.__hash__(self)
+
+    def __eq__(self, other: object) -> bool:
+        """Equality is based on object identity."""
+        return self is other
+
+    @property
+    def name(self) -> str | None:
+        """Return the tool name from tool_name or raw_item (backwards compatible)."""
+        if self.tool_name:
+            return self.tool_name
+        if isinstance(self.raw_item, dict):
+            candidate = self.raw_item.get("name") or self.raw_item.get("tool_name")
+        else:
+            candidate = getattr(self.raw_item, "name", None) or getattr(
+                self.raw_item, "tool_name", None
+            )
+        return str(candidate) if candidate is not None else None
+
+    @property
+    def arguments(self) -> str | None:
+        """Return tool call arguments if present on the raw item."""
+        candidate: Any | None = None
+        if isinstance(self.raw_item, dict):
+            candidate = self.raw_item.get("arguments")
+            if candidate is None:
+                candidate = self.raw_item.get("params") or self.raw_item.get("input")
+        elif hasattr(self.raw_item, "arguments"):
+            candidate = self.raw_item.arguments
+        elif hasattr(self.raw_item, "params") or hasattr(self.raw_item, "input"):
+            candidate = getattr(self.raw_item, "params", None) or getattr(
+                self.raw_item, "input", None
+            )
+        if candidate is None:
+            return None
+        if isinstance(candidate, str):
+            return candidate
+        try:
+            return json.dumps(candidate)
+        except (TypeError, ValueError):
+            return str(candidate)
+
+    def _extract_call_id(self) -> str | None:
+        """Return call identifier from the raw item."""
+        if isinstance(self.raw_item, dict):
+            return self.raw_item.get("call_id") or self.raw_item.get("id")
+        return getattr(self.raw_item, "call_id", None) or getattr(self.raw_item, "id", None)
+
+    @property
+    def call_id(self) -> str | None:
+        """Return call identifier from the raw item."""
+        return self._extract_call_id()
+
+    def to_input_item(self) -> TResponseInputItem:
+        """ToolApprovalItem should never be sent as input; raise to surface misuse."""
+        raise AgentsException(
+            "ToolApprovalItem cannot be converted to an input item. "
+            "These items should be filtered out before preparing input for the API."
+        )
+
+
 RunItem: TypeAlias = Union[
     MessageOutputItem,
     HandoffCallItem,
     HandoffOutputItem,
     ToolCallItem,
     ToolCallOutputItem,
+    CompactionItem,
     ReasoningItem,
     MCPListToolsItem,
     MCPApprovalRequestItem,
     MCPApprovalResponseItem,
     CompactionItem,
+    ToolApprovalItem,
 ]
 """An item generated by an agent."""
 
@@ -367,6 +482,9 @@ class ModelResponse:
     If using OpenAI models via the Responses API, this is the `response_id` parameter, and it can
     be passed to `Runner.run`.
     """
+
+    request_id: str | None = None
+    """The transport request ID for this model call, if provided by the model SDK."""
 
     def to_input_items(self) -> list[TResponseInputItem]:
         """Convert the output into a list of input items suitable for passing to the model."""
@@ -417,7 +535,7 @@ class ItemHelpers:
                     "role": "user",
                 }
             ]
-        return input.copy()
+        return cast(list[TResponseInputItem], _to_dump_compatible(input))
 
     @classmethod
     def text_message_outputs(cls, items: list[RunItem]) -> str:

@@ -42,7 +42,7 @@ from ...items import ModelResponse, TResponseInputItem, TResponseStreamEvent
 from ...logger import logger
 from ...model_settings import ModelSettings
 from ...models.chatcmpl_converter import Converter
-from ...models.chatcmpl_helpers import HEADERS, HEADERS_OVERRIDE
+from ...models.chatcmpl_helpers import HEADERS, HEADERS_OVERRIDE, ChatCmplHelpers
 from ...models.chatcmpl_stream_handler import ChatCmplStreamHandler
 from ...models.fake_id import FAKE_RESPONSES_ID
 from ...models.interface import Model, ModelTracing
@@ -234,8 +234,12 @@ class LitellmModel(Model):
                     [message.model_dump()] if message is not None else []
                 )
             span_generation.span_data.usage = {
+                "requests": usage.requests,
                 "input_tokens": usage.input_tokens,
                 "output_tokens": usage.output_tokens,
+                "total_tokens": usage.total_tokens,
+                "input_tokens_details": usage.input_tokens_details.model_dump(),
+                "output_tokens_details": usage.output_tokens_details.model_dump(),
             }
 
             # Build provider_data for provider specific fields
@@ -304,8 +308,20 @@ class LitellmModel(Model):
 
             if final_response and final_response.usage:
                 span_generation.span_data.usage = {
+                    "requests": 1,
                     "input_tokens": final_response.usage.input_tokens,
                     "output_tokens": final_response.usage.output_tokens,
+                    "total_tokens": final_response.usage.total_tokens,
+                    "input_tokens_details": (
+                        final_response.usage.input_tokens_details.model_dump()
+                        if final_response.usage.input_tokens_details
+                        else {"cached_tokens": 0}
+                    ),
+                    "output_tokens_details": (
+                        final_response.usage.output_tokens_details.model_dump()
+                        if final_response.usage.output_tokens_details
+                        else {"reasoning_tokens": 0}
+                    ),
                 }
 
     @overload
@@ -364,8 +380,9 @@ class LitellmModel(Model):
             model=self.model,
         )
 
-        # Fix for interleaved thinking bug: reorder messages to ensure tool_use comes before tool_result  # noqa: E501
-        if "anthropic" in self.model.lower() or "claude" in self.model.lower():
+        # Fix message ordering: reorder to ensure tool_use comes before tool_result.
+        # Required for Anthropic and Vertex AI Gemini APIs which reject tool responses without preceding tool calls.  # noqa: E501
+        if any(model.lower() in self.model.lower() for model in ["anthropic", "claude", "gemini"]):
             converted_messages = self._fix_tool_message_ordering(converted_messages)
 
         # Convert Google's extra_content to litellm's provider_specific_fields format
@@ -588,8 +605,8 @@ class LitellmModel(Model):
         """
         Fix the ordering of tool messages to ensure tool_use messages come before tool_result messages.
 
-        This addresses the interleaved thinking bug where conversation histories may contain
-        tool results before their corresponding tool calls, causing Anthropic API to reject the request.
+        Required for Anthropic and Vertex AI Gemini APIs which require tool calls to immediately
+        precede their corresponding tool responses in conversation history.
         """  # noqa: E501
         if not messages:
             return messages
@@ -802,12 +819,7 @@ class LitellmConverter:
     ) -> ChatCompletionMessageFunctionToolCall:
         # Clean up litellm's addition of __thought__ suffix to tool_call.id for
         # Gemini models. See: https://github.com/BerriAI/litellm/pull/16895
-        # This suffix is redundant since we can get thought_signature from
-        # provider_specific_fields, and this hack causes validation errors when
-        # cross-model passing to other models.
-        tool_call_id = tool_call.id
-        if model and "gemini" in model.lower() and "__thought__" in tool_call_id:
-            tool_call_id = tool_call_id.split("__thought__")[0]
+        tool_call_id = ChatCmplHelpers.clean_gemini_tool_call_id(tool_call.id, model)
 
         # Convert litellm's tool call format to chat completion message format
         base_tool_call = ChatCompletionMessageFunctionToolCall(

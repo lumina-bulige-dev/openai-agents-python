@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
+import json
 from typing import Any, cast
 
 import pytest
 from openai.types.responses import ResponseOutputMessage, ResponseOutputText
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from agents import (
     Agent,
@@ -14,15 +16,28 @@ from agents import (
     AgentToolStreamEvent,
     FunctionTool,
     MessageOutputItem,
+    ModelBehaviorError,
     RunConfig,
     RunContextWrapper,
     RunHooks,
     Runner,
+    RunResult,
+    RunResultStreaming,
     Session,
+    SessionSettings,
+    ToolApprovalItem,
     TResponseInputItem,
 )
+from agents.agent_tool_input import StructuredToolInputBuilderOptions
+from agents.agent_tool_state import (
+    get_agent_tool_state_scope,
+    record_agent_tool_run_result,
+    set_agent_tool_state_scope,
+)
+from agents.run_state import _build_agent_map
 from agents.stream_events import AgentUpdatedStreamEvent, RawResponsesStreamEvent
 from agents.tool_context import ToolContext
+from tests.utils.hitl import make_function_tool_call
 
 
 class BoolCtx(BaseModel):
@@ -300,6 +315,7 @@ async def test_agent_as_tool_custom_output_extractor(monkeypatch: pytest.MonkeyP
 
     class DummySession(Session):
         session_id = "sess_123"
+        session_settings = SessionSettings()
 
         async def get_items(self, limit: int | None = None) -> list[TResponseInputItem]:
             return []
@@ -336,7 +352,9 @@ async def test_agent_as_tool_custom_output_extractor(monkeypatch: pytest.MonkeyP
     ):
         assert starting_agent is agent
         assert input == "summarize this"
-        assert context is None
+        assert isinstance(context, ToolContext)
+        assert context.tool_call_id == "call_2"
+        assert context.tool_name == "summary_tool"
         assert max_turns == 7
         assert hooks is hooks_obj
         assert run_config is run_config_obj
@@ -377,6 +395,763 @@ async def test_agent_as_tool_custom_output_extractor(monkeypatch: pytest.MonkeyP
     output = await tool.on_invoke_tool(tool_context, '{"input": "summarize this"}')
 
     assert output == "custom output"
+
+
+@pytest.mark.asyncio
+async def test_agent_as_tool_extractor_can_access_agent_tool_invocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = Agent(name="nested_agent")
+    run_result = RunResult(
+        input="hello",
+        new_items=[],
+        raw_responses=[],
+        final_output="done",
+        input_guardrail_results=[],
+        output_guardrail_results=[],
+        tool_input_guardrail_results=[],
+        tool_output_guardrail_results=[],
+        context_wrapper=ToolContext(
+            context=None,
+            tool_name="nested_tool",
+            tool_call_id="call_abc_123",
+            tool_arguments='{"input": "hello"}',
+        ),
+        _last_agent=agent,
+    )
+
+    async def fake_run(
+        cls,
+        starting_agent,
+        input,
+        *,
+        context,
+        max_turns,
+        hooks,
+        run_config,
+        previous_response_id,
+        conversation_id,
+        session,
+    ):
+        del cls, starting_agent, input, context, max_turns, hooks, run_config
+        del previous_response_id, conversation_id, session
+        return run_result
+
+    monkeypatch.setattr(Runner, "run", classmethod(fake_run))
+
+    received_tool_call_id: str | None = None
+
+    async def extractor(result: RunResult | RunResultStreaming) -> str:
+        nonlocal received_tool_call_id
+        invocation = result.agent_tool_invocation
+        assert invocation is not None
+        received_tool_call_id = invocation.tool_call_id
+        assert invocation.tool_name == "nested_tool"
+        assert invocation.tool_arguments == '{"input": "hello"}'
+        return "extracted"
+
+    tool = agent.as_tool(
+        tool_name="nested_tool",
+        tool_description="A nested agent tool",
+        custom_output_extractor=extractor,
+    )
+
+    parent_tool_context = ToolContext(
+        context=None,
+        tool_name="nested_tool",
+        tool_call_id="call_abc_123",
+        tool_arguments='{"input": "hello"}',
+    )
+    output = await tool.on_invoke_tool(parent_tool_context, '{"input": "hello"}')
+
+    assert output == "extracted"
+    assert received_tool_call_id == "call_abc_123"
+
+
+@pytest.mark.asyncio
+async def test_agent_as_tool_inherits_parent_run_config_when_not_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = Agent(name="inherits_config_agent")
+    parent_run_config = RunConfig(model="gpt-4.1-mini")
+
+    class DummyResult:
+        def __init__(self) -> None:
+            self.final_output = "ok"
+
+    async def fake_run(
+        cls,
+        starting_agent,
+        input,
+        *,
+        context,
+        max_turns,
+        hooks,
+        run_config,
+        previous_response_id,
+        conversation_id,
+        session,
+    ):
+        assert starting_agent is agent
+        assert input == "hello"
+        assert isinstance(context, ToolContext)
+        assert run_config is parent_run_config
+        assert context.run_config is parent_run_config
+        return DummyResult()
+
+    monkeypatch.setattr(Runner, "run", classmethod(fake_run))
+
+    tool = agent.as_tool(
+        tool_name="inherits_config_tool",
+        tool_description="inherit config",
+    )
+    tool_context = ToolContext(
+        context=None,
+        tool_name="inherits_config_tool",
+        tool_call_id="call_inherit",
+        tool_arguments='{"input":"hello"}',
+        run_config=parent_run_config,
+    )
+
+    output = await tool.on_invoke_tool(tool_context, '{"input":"hello"}')
+
+    assert output == "ok"
+
+
+@pytest.mark.asyncio
+async def test_agent_as_tool_explicit_run_config_overrides_parent_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = Agent(name="override_config_agent")
+    parent_run_config = RunConfig(model="gpt-4.1-mini")
+    explicit_run_config = RunConfig(model="gpt-4.1")
+
+    class DummyResult:
+        def __init__(self) -> None:
+            self.final_output = "ok"
+
+    async def fake_run(
+        cls,
+        starting_agent,
+        input,
+        *,
+        context,
+        max_turns,
+        hooks,
+        run_config,
+        previous_response_id,
+        conversation_id,
+        session,
+    ):
+        assert starting_agent is agent
+        assert input == "hello"
+        assert isinstance(context, ToolContext)
+        assert run_config is explicit_run_config
+        assert context.run_config is explicit_run_config
+        return DummyResult()
+
+    monkeypatch.setattr(Runner, "run", classmethod(fake_run))
+
+    tool = agent.as_tool(
+        tool_name="override_config_tool",
+        tool_description="override config",
+        run_config=explicit_run_config,
+    )
+    tool_context = ToolContext(
+        context=None,
+        tool_name="override_config_tool",
+        tool_call_id="call_override",
+        tool_arguments='{"input":"hello"}',
+        run_config=parent_run_config,
+    )
+
+    output = await tool.on_invoke_tool(tool_context, '{"input":"hello"}')
+
+    assert output == "ok"
+
+
+@pytest.mark.asyncio
+async def test_agent_as_tool_inherits_trace_include_sensitive_data_setting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = Agent(name="trace_config_agent")
+    parent_run_config = RunConfig(trace_include_sensitive_data=False)
+
+    class DummyResult:
+        def __init__(self) -> None:
+            self.final_output = "ok"
+
+    async def fake_run(
+        cls,
+        starting_agent,
+        input,
+        *,
+        context,
+        max_turns,
+        hooks,
+        run_config,
+        previous_response_id,
+        conversation_id,
+        session,
+    ):
+        assert starting_agent is agent
+        assert input == "hello"
+        assert isinstance(context, ToolContext)
+        assert run_config is parent_run_config
+        assert run_config.trace_include_sensitive_data is False
+        return DummyResult()
+
+    monkeypatch.setattr(Runner, "run", classmethod(fake_run))
+
+    tool = agent.as_tool(
+        tool_name="trace_config_tool",
+        tool_description="inherits trace config",
+    )
+    tool_context = ToolContext(
+        context=None,
+        tool_name="trace_config_tool",
+        tool_call_id="call_trace",
+        tool_arguments='{"input":"hello"}',
+        run_config=parent_run_config,
+    )
+
+    output = await tool.on_invoke_tool(tool_context, '{"input":"hello"}')
+
+    assert output == "ok"
+
+
+@pytest.mark.asyncio
+async def test_agent_as_tool_structured_input_sets_tool_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Structured agent tools should capture input data and pass JSON to the nested run."""
+
+    class TranslationInput(BaseModel):
+        text: str
+        source: str
+        target: str
+
+    agent = Agent(name="translator")
+    tool = agent.as_tool(
+        tool_name="translate",
+        tool_description="Translate text",
+        parameters=TranslationInput,
+    )
+
+    captured: dict[str, Any] = {}
+
+    class DummyResult:
+        def __init__(self) -> None:
+            self.final_output = "ok"
+
+    async def fake_run(
+        cls,
+        starting_agent,
+        input,
+        *,
+        context,
+        max_turns,
+        hooks,
+        run_config,
+        previous_response_id,
+        conversation_id,
+        session,
+    ):
+        captured["input"] = input
+        captured["context"] = context
+        return DummyResult()
+
+    monkeypatch.setattr(Runner, "run", classmethod(fake_run))
+
+    run_context = RunContextWrapper({"locale": "en-US"})
+    args = {"text": "hola", "source": "es", "target": "en"}
+    tool_context = ToolContext(
+        context=run_context.context,
+        usage=run_context.usage,
+        tool_name="translate",
+        tool_call_id="call_structured",
+        tool_arguments=json.dumps(args),
+    )
+
+    await tool.on_invoke_tool(tool_context, json.dumps(args))
+
+    called_input = captured["input"]
+    assert isinstance(called_input, str)
+    assert json.loads(called_input) == args
+
+    nested_context = captured["context"]
+    assert isinstance(nested_context, ToolContext)
+    assert nested_context.context is run_context.context
+    assert nested_context.usage is run_context.usage
+    assert nested_context.tool_input == args
+    assert run_context.tool_input is None
+
+
+@pytest.mark.asyncio
+async def test_agent_as_tool_clears_stale_tool_input_for_plain_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-structured agent tools should not inherit stale tool input."""
+
+    agent = Agent(name="plain_agent")
+    tool = agent.as_tool(
+        tool_name="plain_tool",
+        tool_description="Plain tool",
+    )
+
+    run_context = RunContextWrapper({"locale": "en-US"})
+    run_context.tool_input = {"text": "bonjour"}
+
+    tool_context = ToolContext(
+        context=run_context.context,
+        usage=run_context.usage,
+        tool_name="plain_tool",
+        tool_call_id="call_plain",
+        tool_arguments='{"input": "hello"}',
+    )
+    tool_context.tool_input = run_context.tool_input
+
+    class DummyResult:
+        def __init__(self) -> None:
+            self.final_output = "ok"
+
+    async def fake_run(
+        cls,
+        starting_agent,
+        input,
+        *,
+        context,
+        max_turns,
+        hooks,
+        run_config,
+        previous_response_id,
+        conversation_id,
+        session,
+    ):
+        assert isinstance(context, ToolContext)
+        assert context.tool_input is None
+        return DummyResult()
+
+    monkeypatch.setattr(Runner, "run", classmethod(fake_run))
+
+    await tool.on_invoke_tool(tool_context, '{"input": "hello"}')
+
+    assert run_context.tool_input == {"text": "bonjour"}
+
+
+@pytest.mark.asyncio
+async def test_agent_as_tool_includes_schema_summary_with_descriptions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Schema descriptions should be summarized for structured inputs."""
+
+    class TranslationInput(BaseModel):
+        text: str = Field(description="Text to translate")
+        target: str = Field(description="Target language")
+
+    agent = Agent(name="summary_agent")
+    tool = agent.as_tool(
+        tool_name="summarize_schema",
+        tool_description="Summary tool",
+        parameters=TranslationInput,
+    )
+
+    captured: dict[str, Any] = {}
+
+    class DummyResult:
+        def __init__(self) -> None:
+            self.final_output = "ok"
+
+    async def fake_run(
+        cls,
+        starting_agent,
+        input,
+        *,
+        context,
+        max_turns,
+        hooks,
+        run_config,
+        previous_response_id,
+        conversation_id,
+        session,
+    ):
+        captured["input"] = input
+        return DummyResult()
+
+    monkeypatch.setattr(Runner, "run", classmethod(fake_run))
+
+    args = {"text": "hola", "target": "en"}
+    tool_context = ToolContext(
+        context=None,
+        tool_name="summarize_schema",
+        tool_call_id="call_summary",
+        tool_arguments=json.dumps(args),
+    )
+
+    await tool.on_invoke_tool(tool_context, json.dumps(args))
+
+    called_input = captured["input"]
+    assert isinstance(called_input, str)
+    assert "Input Schema Summary:" in called_input
+    assert "text (string, required)" in called_input
+    assert "Text to translate" in called_input
+    assert "target (string, required)" in called_input
+    assert "Target language" in called_input
+    assert '"text": "hola"' in called_input
+    assert '"target": "en"' in called_input
+
+
+@pytest.mark.asyncio
+async def test_agent_as_tool_supports_custom_input_builder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Custom input builders should supply nested input items."""
+
+    class TranslationInput(BaseModel):
+        text: str
+
+    agent = Agent(name="builder_agent")
+    builder_calls: list[StructuredToolInputBuilderOptions] = []
+    custom_items = [{"role": "user", "content": "custom input"}]
+
+    async def builder(options: StructuredToolInputBuilderOptions):
+        builder_calls.append(options)
+        return custom_items
+
+    tool = agent.as_tool(
+        tool_name="builder_tool",
+        tool_description="Builder tool",
+        parameters=TranslationInput,
+        input_builder=builder,
+    )
+
+    class DummyResult:
+        def __init__(self) -> None:
+            self.final_output = "ok"
+
+    async def fake_run(
+        cls,
+        starting_agent,
+        input,
+        *,
+        context,
+        max_turns,
+        hooks,
+        run_config,
+        previous_response_id,
+        conversation_id,
+        session,
+    ):
+        assert input == custom_items
+        return DummyResult()
+
+    monkeypatch.setattr(Runner, "run", classmethod(fake_run))
+
+    args = {"text": "hola"}
+    tool_context = ToolContext(
+        context=None,
+        tool_name="builder_tool",
+        tool_call_id="call_builder",
+        tool_arguments=json.dumps(args),
+    )
+
+    await tool.on_invoke_tool(tool_context, json.dumps(args))
+
+    assert builder_calls
+    assert builder_calls[0]["params"] == args
+    assert builder_calls[0]["summary"] is None
+    assert builder_calls[0]["json_schema"] is None
+
+
+@pytest.mark.asyncio
+async def test_agent_as_tool_rejects_invalid_builder_output() -> None:
+    """Invalid builder output should surface as a tool error."""
+
+    agent = Agent(name="invalid_builder_agent")
+
+    def builder(_options):
+        return 123
+
+    tool = agent.as_tool(
+        tool_name="invalid_builder_tool",
+        tool_description="Invalid builder tool",
+        input_builder=builder,
+    )
+
+    tool_context = ToolContext(
+        context=None,
+        tool_name="invalid_builder_tool",
+        tool_call_id="call_invalid_builder",
+        tool_arguments='{"input": "hi"}',
+    )
+    result = await tool.on_invoke_tool(tool_context, '{"input": "hi"}')
+
+    assert "Agent tool called with invalid input" in result
+
+
+@pytest.mark.asyncio
+async def test_agent_as_tool_includes_json_schema_when_requested(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """include_input_schema should embed the full JSON schema."""
+
+    class TranslationInput(BaseModel):
+        text: str = Field(description="Text to translate")
+        target: str = Field(description="Target language")
+
+    agent = Agent(name="schema_agent")
+    tool = agent.as_tool(
+        tool_name="schema_tool",
+        tool_description="Schema tool",
+        parameters=TranslationInput,
+        include_input_schema=True,
+    )
+
+    captured: dict[str, Any] = {}
+
+    class DummyResult:
+        def __init__(self) -> None:
+            self.final_output = "ok"
+
+    async def fake_run(
+        cls,
+        starting_agent,
+        input,
+        *,
+        context,
+        max_turns,
+        hooks,
+        run_config,
+        previous_response_id,
+        conversation_id,
+        session,
+    ):
+        captured["input"] = input
+        return DummyResult()
+
+    monkeypatch.setattr(Runner, "run", classmethod(fake_run))
+
+    args = {"text": "hola", "target": "en"}
+    tool_context = ToolContext(
+        context=None,
+        tool_name="schema_tool",
+        tool_call_id="call_schema",
+        tool_arguments=json.dumps(args),
+    )
+
+    await tool.on_invoke_tool(tool_context, json.dumps(args))
+
+    called_input = captured["input"]
+    assert isinstance(called_input, str)
+    assert "Input JSON Schema:" in called_input
+    assert '"properties"' in called_input
+    assert '"text"' in called_input
+    assert '"target"' in called_input
+
+
+@pytest.mark.asyncio
+async def test_agent_as_tool_ignores_input_schema_without_parameters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """include_input_schema should be ignored when no parameters are provided."""
+
+    agent = Agent(name="default_schema_agent")
+    tool = agent.as_tool(
+        tool_name="default_schema_tool",
+        tool_description="Default schema tool",
+        include_input_schema=True,
+    )
+
+    captured: dict[str, Any] = {}
+
+    class DummyResult:
+        def __init__(self) -> None:
+            self.final_output = "ok"
+
+    async def fake_run(
+        cls,
+        starting_agent,
+        input,
+        *,
+        context,
+        max_turns,
+        hooks,
+        run_config,
+        previous_response_id,
+        conversation_id,
+        session,
+    ):
+        captured["input"] = input
+        return DummyResult()
+
+    monkeypatch.setattr(Runner, "run", classmethod(fake_run))
+
+    tool_context = ToolContext(
+        context=None,
+        tool_name="default_schema_tool",
+        tool_call_id="call_default_schema",
+        tool_arguments='{"input": "hello"}',
+    )
+
+    await tool.on_invoke_tool(tool_context, '{"input": "hello"}')
+
+    assert captured["input"] == "hello"
+    assert "properties" in tool.params_json_schema
+
+
+@pytest.mark.asyncio
+async def test_agent_as_tool_rejected_nested_approval_resumes_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rejected nested approvals should resume the pending run with rejection applied."""
+
+    agent = Agent(name="outer")
+    tool_call = make_function_tool_call(
+        "outer_tool",
+        call_id="outer-1",
+        arguments='{"input": "hello"}',
+    )
+    tool_context = ToolContext(
+        context=None,
+        tool_name="outer_tool",
+        tool_call_id="outer-1",
+        tool_arguments=tool_call.arguments,
+        tool_call=tool_call,
+    )
+
+    inner_call = make_function_tool_call("inner_tool", call_id="inner-1")
+    approval_item = ToolApprovalItem(agent=agent, raw_item=inner_call)
+
+    class DummyState:
+        def __init__(self, nested_context: ToolContext) -> None:
+            self._context = nested_context
+
+    class DummyPendingResult:
+        def __init__(self) -> None:
+            self.interruptions = [approval_item]
+            self.final_output = None
+
+        def to_state(self) -> DummyState:
+            return resume_state
+
+    class DummyResumedResult:
+        def __init__(self) -> None:
+            self.interruptions: list[ToolApprovalItem] = []
+            self.final_output = "rejected"
+
+    nested_context = ToolContext(
+        context=None,
+        tool_name=tool_call.name,
+        tool_call_id=tool_call.call_id,
+        tool_arguments=tool_call.arguments,
+        tool_call=tool_call,
+    )
+    resume_state = DummyState(nested_context)
+    pending_result = DummyPendingResult()
+    record_agent_tool_run_result(tool_call, cast(Any, pending_result))
+    tool_context.reject_tool(approval_item)
+
+    resumed_result = DummyResumedResult()
+    run_inputs: list[Any] = []
+
+    async def run_resume(cls, /, starting_agent, input, **kwargs) -> DummyResumedResult:
+        run_inputs.append(input)
+        assert input is resume_state
+        assert input._context is not None
+        assert input._context.is_tool_approved("inner_tool", "inner-1") is False
+        return resumed_result
+
+    monkeypatch.setattr(Runner, "run", classmethod(run_resume))
+
+    async def extractor(result: Any) -> str:
+        assert result is resumed_result
+        return "from_resume"
+
+    tool = agent.as_tool(
+        tool_name="outer_tool",
+        tool_description="Outer agent tool",
+        custom_output_extractor=extractor,
+        is_enabled=True,
+    )
+
+    output = await tool.on_invoke_tool(tool_context, tool_call.arguments)
+
+    assert output == "from_resume"
+    assert run_inputs == [resume_state]
+
+
+@pytest.mark.asyncio
+async def test_agent_as_tool_preserves_scope_for_nested_tool_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Nested ToolContext instances should inherit the parent tool-state scope."""
+
+    class DummyResult:
+        def __init__(self) -> None:
+            self.final_output = "ok"
+            self.interruptions: list[ToolApprovalItem] = []
+
+    scope_id = "resume-scope"
+    agent = Agent(name="scope-agent")
+    tool = agent.as_tool(tool_name="scope_tool", tool_description="Scope tool")
+
+    async def fake_run(cls, /, starting_agent, input, **kwargs) -> DummyResult:
+        del cls, starting_agent, input
+        nested_context = kwargs.get("context")
+        assert isinstance(nested_context, ToolContext)
+        assert get_agent_tool_state_scope(nested_context) == scope_id
+        return DummyResult()
+
+    monkeypatch.setattr(Runner, "run", classmethod(fake_run))
+
+    tool_context = ToolContext(
+        context=None,
+        tool_name="scope_tool",
+        tool_call_id="scope-call",
+        tool_arguments='{"input":"hello"}',
+    )
+    set_agent_tool_state_scope(tool_context, scope_id)
+
+    output = await tool.on_invoke_tool(tool_context, '{"input":"hello"}')
+    assert output == "ok"
+
+
+@pytest.mark.asyncio
+async def test_agent_as_tool_preserves_scope_for_nested_run_context_wrapper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Nested RunContextWrapper instances should inherit the parent tool-state scope."""
+
+    class Params(BaseModel):
+        text: str
+
+    class DummyResult:
+        def __init__(self) -> None:
+            self.final_output = "ok"
+            self.interruptions: list[ToolApprovalItem] = []
+
+    scope_id = "resume-scope-wrapper"
+    agent = Agent(name="scope-agent-wrapper")
+    tool = agent.as_tool(
+        tool_name="scope_tool_wrapper",
+        tool_description="Scope tool wrapper",
+        parameters=Params,
+    )
+
+    async def fake_run(cls, /, starting_agent, input, **kwargs) -> DummyResult:
+        del cls, starting_agent, input
+        nested_context = kwargs.get("context")
+        assert isinstance(nested_context, RunContextWrapper)
+        assert get_agent_tool_state_scope(nested_context) == scope_id
+        return DummyResult()
+
+    monkeypatch.setattr(Runner, "run", classmethod(fake_run))
+
+    parent_context = RunContextWrapper(context={"key": "value"})
+    set_agent_tool_state_scope(parent_context, scope_id)
+
+    output = await tool.on_invoke_tool(cast(Any, parent_context), '{"text":"hello"}')
+    assert output == "ok"
 
 
 @pytest.mark.asyncio
@@ -448,13 +1223,10 @@ async def test_agent_as_tool_streams_events_with_on_stream(
         type="function_call",
     )
 
-    tool = cast(
-        FunctionTool,
-        agent.as_tool(
-            tool_name="stream_tool",
-            tool_description="Streams events",
-            on_stream=on_stream,
-        ),
+    tool = agent.as_tool(
+        tool_name="stream_tool",
+        tool_description="Streams events",
+        on_stream=on_stream,
     )
 
     tool_context = ToolContext(
@@ -525,13 +1297,10 @@ async def test_agent_as_tool_streaming_updates_agent_on_handoff(
     async def on_stream(payload: AgentToolStreamEvent) -> None:
         seen_agents.append(payload["agent"])
 
-    tool = cast(
-        FunctionTool,
-        first_agent.as_tool(
-            tool_name="delegate_tool",
-            tool_description="Streams handoff events",
-            on_stream=on_stream,
-        ),
+    tool = first_agent.as_tool(
+        tool_name="delegate_tool",
+        tool_description="Streams handoff events",
+        on_stream=on_stream,
     )
 
     tool_call = ResponseFunctionToolCall(
@@ -561,18 +1330,29 @@ async def test_agent_as_tool_streaming_works_with_custom_extractor(
 ) -> None:
     agent = Agent(name="streamer")
     stream_events = [RawResponsesStreamEvent(data=cast(Any, {"type": "response_started"}))]
-    stream_events = [RawResponsesStreamEvent(data=cast(Any, {"type": "response_started"}))]
-
-    class DummyStreamingResult:
-        def __init__(self) -> None:
-            self.final_output = "raw output"
-            self.current_agent = agent
-
-        async def stream_events(self):
-            for ev in stream_events:
-                yield ev
-
-    streamed_instance = DummyStreamingResult()
+    streamed_instance = RunResultStreaming(
+        input="stream please",
+        new_items=[],
+        raw_responses=[],
+        final_output="raw output",
+        input_guardrail_results=[],
+        output_guardrail_results=[],
+        tool_input_guardrail_results=[],
+        tool_output_guardrail_results=[],
+        context_wrapper=ToolContext(
+            context=None,
+            tool_name="stream_tool",
+            tool_call_id="call-abc",
+            tool_arguments='{"input": "stream please"}',
+        ),
+        current_agent=agent,
+        current_turn=0,
+        max_turns=1,
+        _current_agent_output_schema=None,
+        trace=None,
+    )
+    streamed_instance._event_queue.put_nowait(stream_events[0])
+    streamed_instance.is_complete = True
 
     def fake_run_streamed(
         cls,
@@ -615,14 +1395,11 @@ async def test_agent_as_tool_streaming_works_with_custom_extractor(
         type="function_call",
     )
 
-    tool = cast(
-        FunctionTool,
-        agent.as_tool(
-            tool_name="stream_tool",
-            tool_description="Streams events",
-            custom_output_extractor=extractor,
-            on_stream=on_stream,
-        ),
+    tool = agent.as_tool(
+        tool_name="stream_tool",
+        tool_description="Streams events",
+        custom_output_extractor=extractor,
+        on_stream=on_stream,
     )
 
     tool_context = ToolContext(
@@ -637,6 +1414,85 @@ async def test_agent_as_tool_streaming_works_with_custom_extractor(
     assert output == "custom value"
     assert received == [streamed_instance]
     assert callbacks == stream_events
+
+
+@pytest.mark.asyncio
+async def test_agent_as_tool_streaming_extractor_can_access_agent_tool_invocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = Agent(name="streaming_tool_context_agent")
+    stream_event = RawResponsesStreamEvent(data=cast(Any, {"type": "response_started"}))
+    streamed_instance = RunResultStreaming(
+        input="go",
+        new_items=[],
+        raw_responses=[],
+        final_output="raw output",
+        input_guardrail_results=[],
+        output_guardrail_results=[],
+        tool_input_guardrail_results=[],
+        tool_output_guardrail_results=[],
+        context_wrapper=ToolContext(
+            context=None,
+            tool_name="stream_tool",
+            tool_call_id="call-stream-123",
+            tool_arguments='{"input": "go"}',
+        ),
+        current_agent=agent,
+        current_turn=0,
+        max_turns=1,
+        _current_agent_output_schema=None,
+        trace=None,
+    )
+    streamed_instance._event_queue.put_nowait(stream_event)
+    streamed_instance.is_complete = True
+
+    def fake_run_streamed(
+        cls,
+        /,
+        starting_agent,
+        input,
+        **kwargs,
+    ) -> RunResultStreaming:
+        del cls, starting_agent, input, kwargs
+        return streamed_instance
+
+    async def unexpected_run(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("Runner.run should not be called when on_stream is provided.")
+
+    monkeypatch.setattr(Runner, "run_streamed", classmethod(fake_run_streamed))
+    monkeypatch.setattr(Runner, "run", classmethod(unexpected_run))
+
+    received_call_id: str | None = None
+
+    async def extractor(result: RunResult | RunResultStreaming) -> str:
+        nonlocal received_call_id
+        invocation = result.agent_tool_invocation
+        assert invocation is not None
+        received_call_id = invocation.tool_call_id
+        assert invocation.tool_name == "stream_tool"
+        assert invocation.tool_arguments == '{"input": "go"}'
+        return "custom value"
+
+    async def on_stream(payload: AgentToolStreamEvent) -> None:
+        del payload
+
+    tool = agent.as_tool(
+        tool_name="stream_tool",
+        tool_description="Streams events",
+        custom_output_extractor=extractor,
+        on_stream=on_stream,
+    )
+
+    tool_context = ToolContext(
+        context=None,
+        tool_name="stream_tool",
+        tool_call_id="call-stream-123",
+        tool_arguments='{"input": "go"}',
+    )
+    output = await tool.on_invoke_tool(tool_context, '{"input": "go"}')
+
+    assert output == "custom value"
+    assert received_call_id == "call-stream-123"
 
 
 @pytest.mark.asyncio
@@ -675,13 +1531,10 @@ async def test_agent_as_tool_streaming_accepts_sync_handler(
         type="function_call",
     )
 
-    tool = cast(
-        FunctionTool,
-        agent.as_tool(
-            tool_name="sync_tool",
-            tool_description="Uses sync handler",
-            on_stream=sync_handler,
-        ),
+    tool = agent.as_tool(
+        tool_name="sync_tool",
+        tool_description="Uses sync handler",
+        on_stream=sync_handler,
     )
     tool_context = ToolContext(
         context=None,
@@ -748,13 +1601,10 @@ async def test_agent_as_tool_streaming_dispatches_without_blocking(
         type="function_call",
     )
 
-    tool = cast(
-        FunctionTool,
-        agent.as_tool(
-            tool_name="nonblocking_tool",
-            tool_description="Uses non-blocking streaming handler",
-            on_stream=on_stream,
-        ),
+    tool = agent.as_tool(
+        tool_name="nonblocking_tool",
+        tool_description="Uses non-blocking streaming handler",
+        on_stream=on_stream,
     )
     tool_context = ToolContext(
         context=None,
@@ -814,13 +1664,10 @@ async def test_agent_as_tool_streaming_handler_exception_does_not_fail_call(
         type="function_call",
     )
 
-    tool = cast(
-        FunctionTool,
-        agent.as_tool(
-            tool_name="error_tool",
-            tool_description="Handler throws",
-            on_stream=bad_handler,
-        ),
+    tool = agent.as_tool(
+        tool_name="error_tool",
+        tool_description="Handler throws",
+        on_stream=bad_handler,
     )
     tool_context = ToolContext(
         context=None,
@@ -871,12 +1718,9 @@ async def test_agent_as_tool_without_stream_uses_run(
         classmethod(lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("no stream"))),
     )
 
-    tool = cast(
-        FunctionTool,
-        agent.as_tool(
-            tool_name="nostream_tool",
-            tool_description="No streaming path",
-        ),
+    tool = agent.as_tool(
+        tool_name="nostream_tool",
+        tool_description="No streaming path",
     )
     tool_context = ToolContext(
         context=None,
@@ -927,13 +1771,10 @@ async def test_agent_as_tool_streaming_sets_tool_call_from_context(
         type="function_call",
     )
 
-    tool = cast(
-        FunctionTool,
-        agent.as_tool(
-            tool_name="direct_stream_tool",
-            tool_description="Direct invocation",
-            on_stream=on_stream,
-        ),
+    tool = agent.as_tool(
+        tool_name="direct_stream_tool",
+        tool_description="Direct invocation",
+        on_stream=on_stream,
     )
     tool_context = ToolContext(
         context=None,
@@ -1042,3 +1883,94 @@ async def test_agent_as_tool_failure_error_function_custom_handler(
 
     result = await tool.on_invoke_tool(tool_context, '{"input": "hello"}')
     assert result == "handled:ValueError:test failure"
+
+
+@pytest.mark.asyncio
+async def test_replaced_agent_as_tool_normal_failure_uses_replaced_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = Agent(name="failing_agent")
+
+    async def fake_run(
+        cls,
+        starting_agent,
+        input,
+        *,
+        context,
+        max_turns,
+        hooks,
+        run_config,
+        previous_response_id,
+        conversation_id,
+        session,
+    ):
+        assert starting_agent is agent
+        assert input == "hello"
+        raise RuntimeError("test failure")
+
+    monkeypatch.setattr(Runner, "run", classmethod(fake_run))
+
+    tool = dataclasses.replace(
+        agent.as_tool(
+            tool_name="failing_agent_tool",
+            tool_description="Agent tool that raises",
+            is_enabled=True,
+        ),
+        _failure_error_function=None,
+        _use_default_failure_error_function=False,
+    )
+
+    tool_context = ToolContext(
+        context=None,
+        tool_name=tool.name,
+        tool_call_id="call_1",
+        tool_arguments='{"input": "hello"}',
+    )
+
+    with pytest.raises(RuntimeError, match="test failure"):
+        await tool.on_invoke_tool(tool_context, '{"input": "hello"}')
+
+
+@pytest.mark.asyncio
+async def test_replaced_agent_as_tool_invalid_input_uses_replaced_name() -> None:
+    nested_agent = Agent(name="nested_agent")
+    replaced_tool = dataclasses.replace(
+        nested_agent.as_tool(
+            tool_name="nested_agent_tool",
+            tool_description="Nested agent tool",
+            is_enabled=True,
+            failure_error_function=None,
+        ),
+        name="replaced_nested_agent_tool",
+    )
+
+    with pytest.raises(
+        ModelBehaviorError,
+        match="Invalid JSON input for tool replaced_nested_agent_tool",
+    ):
+        await replaced_tool.on_invoke_tool(
+            ToolContext(
+                context=None,
+                tool_name=replaced_tool.name,
+                tool_call_id="call_1",
+                tool_arguments="{}",
+            ),
+            "{}",
+        )
+
+
+def test_replaced_agent_as_tool_preserves_agent_markers_for_build_agent_map() -> None:
+    nested_agent = Agent(name="nested_agent")
+    replaced_tool = dataclasses.replace(
+        nested_agent.as_tool(
+            tool_name="nested_agent_tool",
+            tool_description="Nested agent tool",
+            is_enabled=True,
+        ),
+        name="replaced_nested_agent_tool",
+    )
+    parent_agent = Agent(name="parent_agent", tools=[replaced_tool])
+
+    agent_map = _build_agent_map(parent_agent)
+
+    assert agent_map["nested_agent"] is nested_agent

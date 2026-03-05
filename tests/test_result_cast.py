@@ -1,33 +1,60 @@
+from __future__ import annotations
+
 import dataclasses
 import gc
 import weakref
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from openai.types.responses import ResponseOutputMessage, ResponseOutputText
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
-from agents import Agent, MessageOutputItem, RunContextWrapper, RunResult, RunResultStreaming
+from agents import (
+    Agent,
+    AgentToolInvocation,
+    MessageOutputItem,
+    RunContextWrapper,
+    RunItem,
+    RunResult,
+    RunResultStreaming,
+)
 from agents.exceptions import AgentsException
+from agents.tool_context import ToolContext
 
 
-def create_run_result(final_output: Any) -> RunResult:
+def create_run_result(
+    final_output: Any | None,
+    *,
+    new_items: list[RunItem] | None = None,
+    last_agent: Agent[Any] | None = None,
+) -> RunResult:
     return RunResult(
         input="test",
-        new_items=[],
+        new_items=new_items or [],
         raw_responses=[],
         final_output=final_output,
         input_guardrail_results=[],
         output_guardrail_results=[],
         tool_input_guardrail_results=[],
         tool_output_guardrail_results=[],
-        _last_agent=Agent(name="test"),
+        _last_agent=last_agent or Agent(name="test"),
         context_wrapper=RunContextWrapper(context=None),
+        interruptions=[],
     )
 
 
 class Foo(BaseModel):
     bar: int
+
+
+def test_run_result_streaming_supports_pydantic_model_rebuild() -> None:
+    class StreamingRunContainer(BaseModel):
+        query_id: str
+        run_stream: RunResultStreaming | None
+
+        model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    StreamingRunContainer.model_rebuild()
 
 
 def _create_message(text: str) -> ResponseOutputMessage:
@@ -80,18 +107,7 @@ def test_run_result_release_agents_breaks_strong_refs() -> None:
     message = _create_message("hello")
     agent = Agent(name="leak-test-agent")
     item = MessageOutputItem(agent=agent, raw_item=message)
-    result = RunResult(
-        input="test",
-        new_items=[item],
-        raw_responses=[],
-        final_output=None,
-        input_guardrail_results=[],
-        output_guardrail_results=[],
-        tool_input_guardrail_results=[],
-        tool_output_guardrail_results=[],
-        _last_agent=agent,
-        context_wrapper=RunContextWrapper(context=None),
-    )
+    result = create_run_result(None, new_items=[item], last_agent=agent)
     assert item.agent is not None
     assert item.agent.name == "leak-test-agent"
 
@@ -111,18 +127,7 @@ def test_run_item_retains_agent_when_result_is_garbage_collected() -> None:
         message = _create_message("persist")
         agent = Agent(name="persisted-agent")
         item = MessageOutputItem(agent=agent, raw_item=message)
-        result = RunResult(
-            input="test",
-            new_items=[item],
-            raw_responses=[],
-            final_output=None,
-            input_guardrail_results=[],
-            output_guardrail_results=[],
-            tool_input_guardrail_results=[],
-            tool_output_guardrail_results=[],
-            _last_agent=agent,
-            context_wrapper=RunContextWrapper(context=None),
-        )
+        result = create_run_result(None, new_items=[item], last_agent=agent)
         return item, weakref.ref(result)
 
     item, result_ref = build_item()
@@ -161,18 +166,7 @@ def test_run_item_repr_and_asdict_after_release() -> None:
 
 def test_run_result_repr_and_asdict_after_release_agents() -> None:
     agent = Agent(name="repr-result-agent")
-    result = RunResult(
-        input="test",
-        new_items=[],
-        raw_responses=[],
-        final_output=None,
-        input_guardrail_results=[],
-        output_guardrail_results=[],
-        tool_input_guardrail_results=[],
-        tool_output_guardrail_results=[],
-        _last_agent=agent,
-        context_wrapper=RunContextWrapper(context=None),
-    )
+    result = create_run_result(None, last_agent=agent)
 
     result.release_agents()
 
@@ -188,18 +182,7 @@ def test_run_result_release_agents_without_releasing_new_items() -> None:
     item_agent = Agent(name="item-agent")
     last_agent = Agent(name="last-agent")
     item = MessageOutputItem(agent=item_agent, raw_item=message)
-    result = RunResult(
-        input="test",
-        new_items=[item],
-        raw_responses=[],
-        final_output=None,
-        input_guardrail_results=[],
-        output_guardrail_results=[],
-        tool_input_guardrail_results=[],
-        tool_output_guardrail_results=[],
-        _last_agent=last_agent,
-        context_wrapper=RunContextWrapper(context=None),
-    )
+    result = create_run_result(None, new_items=[item], last_agent=last_agent)
 
     result.release_agents(release_new_items=False)
 
@@ -229,6 +212,7 @@ def test_run_result_release_agents_is_idempotent() -> None:
         tool_output_guardrail_results=[],
         _last_agent=agent,
         context_wrapper=RunContextWrapper(context=None),
+        interruptions=[],
     )
 
     result.release_agents()
@@ -263,6 +247,7 @@ def test_run_result_streaming_release_agents_releases_current_agent() -> None:
         max_turns=1,
         _current_agent_output_schema=None,
         trace=None,
+        interruptions=[],
     )
 
     streaming_result.release_agents(release_new_items=False)
@@ -274,3 +259,75 @@ def test_run_result_streaming_release_agents_releases_current_agent() -> None:
     assert agent_ref() is None
     with pytest.raises(AgentsException):
         _ = streaming_result.last_agent
+
+
+def test_run_result_agent_tool_invocation_returns_none_for_plain_context() -> None:
+    result = create_run_result("ok")
+
+    assert result.agent_tool_invocation is None
+
+
+def test_run_result_agent_tool_invocation_returns_immutable_metadata() -> None:
+    tool_ctx = ToolContext(
+        context=None,
+        tool_name="my_tool",
+        tool_call_id="call_xyz",
+        tool_arguments="{}",
+    )
+    result = RunResult(
+        input="test",
+        new_items=[],
+        raw_responses=[],
+        final_output="ok",
+        input_guardrail_results=[],
+        output_guardrail_results=[],
+        tool_input_guardrail_results=[],
+        tool_output_guardrail_results=[],
+        _last_agent=Agent(name="test"),
+        context_wrapper=tool_ctx,
+        interruptions=[],
+    )
+
+    assert result.agent_tool_invocation == AgentToolInvocation(
+        tool_name="my_tool",
+        tool_call_id="call_xyz",
+        tool_arguments="{}",
+    )
+
+    invocation = result.agent_tool_invocation
+    assert invocation is not None
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        cast(Any, invocation).tool_name = "other"
+
+
+def test_run_result_streaming_agent_tool_invocation_returns_metadata() -> None:
+    agent = Agent(name="streaming-tool-agent")
+    tool_ctx = ToolContext(
+        context=None,
+        tool_name="stream_tool",
+        tool_call_id="call_stream",
+        tool_arguments='{"input":"stream"}',
+    )
+    result = RunResultStreaming(
+        input="stream",
+        new_items=[],
+        raw_responses=[],
+        final_output="done",
+        input_guardrail_results=[],
+        output_guardrail_results=[],
+        tool_input_guardrail_results=[],
+        tool_output_guardrail_results=[],
+        context_wrapper=tool_ctx,
+        current_agent=agent,
+        current_turn=0,
+        max_turns=1,
+        _current_agent_output_schema=None,
+        trace=None,
+        interruptions=[],
+    )
+
+    assert result.agent_tool_invocation == AgentToolInvocation(
+        tool_name="stream_tool",
+        tool_call_id="call_stream",
+        tool_arguments='{"input":"stream"}',
+    )

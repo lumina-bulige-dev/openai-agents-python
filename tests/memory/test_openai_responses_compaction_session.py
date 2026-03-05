@@ -20,7 +20,7 @@ from agents.memory.openai_responses_compaction_session import (
     select_compaction_candidate_items,
 )
 from tests.fake_model import FakeModel
-from tests.test_responses import get_text_message
+from tests.test_responses import get_function_tool, get_function_tool_call, get_text_message
 from tests.utils.simple_session import SimpleListSession
 
 
@@ -142,10 +142,188 @@ class TestOpenAIResponsesCompactionSession:
         session = OpenAIResponsesCompactionSession(
             session_id="test",
             underlying_session=mock_session,
+            compaction_mode="previous_response_id",
         )
 
-        with pytest.raises(ValueError, match="requires a response_id"):
+        with pytest.raises(ValueError, match="previous_response_id compaction"):
             await session.run_compaction()
+
+    @pytest.mark.asyncio
+    async def test_run_compaction_input_mode_without_response_id(self) -> None:
+        mock_session = self.create_mock_session()
+        items: list[TResponseInputItem] = [
+            cast(TResponseInputItem, {"type": "message", "role": "user", "content": "hello"}),
+            cast(
+                TResponseInputItem,
+                {"type": "message", "role": "assistant", "content": "world"},
+            ),
+        ]
+        mock_session.get_items.return_value = items
+
+        mock_compact_response = MagicMock()
+        mock_compact_response.output = [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": "compacted",
+            }
+        ]
+
+        mock_client = MagicMock()
+        mock_client.responses.compact = AsyncMock(return_value=mock_compact_response)
+
+        session = OpenAIResponsesCompactionSession(
+            session_id="test",
+            underlying_session=mock_session,
+            client=mock_client,
+            compaction_mode="input",
+        )
+
+        await session.run_compaction({"force": True})
+
+        mock_client.responses.compact.assert_called_once()
+        call_kwargs = mock_client.responses.compact.call_args.kwargs
+        assert call_kwargs.get("model") == "gpt-4.1"
+        assert "previous_response_id" not in call_kwargs
+        assert call_kwargs.get("input") == items
+
+    @pytest.mark.asyncio
+    async def test_run_compaction_auto_without_response_id_uses_input(self) -> None:
+        mock_session = self.create_mock_session()
+        items: list[TResponseInputItem] = [
+            cast(TResponseInputItem, {"type": "message", "role": "user", "content": "hello"}),
+        ]
+        mock_session.get_items.return_value = items
+
+        mock_compact_response = MagicMock()
+        mock_compact_response.output = []
+
+        mock_client = MagicMock()
+        mock_client.responses.compact = AsyncMock(return_value=mock_compact_response)
+
+        session = OpenAIResponsesCompactionSession(
+            session_id="test",
+            underlying_session=mock_session,
+            client=mock_client,
+        )
+
+        await session.run_compaction({"force": True})
+
+        mock_client.responses.compact.assert_called_once()
+        call_kwargs = mock_client.responses.compact.call_args.kwargs
+        assert "previous_response_id" not in call_kwargs
+        assert call_kwargs.get("input") == items
+
+    @pytest.mark.asyncio
+    async def test_run_compaction_auto_uses_input_when_store_false(self) -> None:
+        mock_session = self.create_mock_session()
+        items: list[TResponseInputItem] = [
+            cast(TResponseInputItem, {"type": "message", "role": "user", "content": "hello"}),
+            cast(
+                TResponseInputItem,
+                {"type": "message", "role": "assistant", "content": "world"},
+            ),
+        ]
+        mock_session.get_items.return_value = items
+
+        mock_compact_response = MagicMock()
+        mock_compact_response.output = []
+
+        mock_client = MagicMock()
+        mock_client.responses.compact = AsyncMock(return_value=mock_compact_response)
+
+        session = OpenAIResponsesCompactionSession(
+            session_id="test",
+            underlying_session=mock_session,
+            client=mock_client,
+            compaction_mode="auto",
+        )
+
+        await session.run_compaction({"response_id": "resp-auto", "store": False, "force": True})
+
+        mock_client.responses.compact.assert_called_once()
+        call_kwargs = mock_client.responses.compact.call_args.kwargs
+        assert call_kwargs.get("model") == "gpt-4.1"
+        assert "previous_response_id" not in call_kwargs
+        assert call_kwargs.get("input") == items
+
+    @pytest.mark.asyncio
+    async def test_run_compaction_auto_uses_default_store_when_unset(self) -> None:
+        mock_session = self.create_mock_session()
+        items: list[TResponseInputItem] = [
+            cast(TResponseInputItem, {"type": "message", "role": "user", "content": "hello"}),
+            cast(
+                TResponseInputItem,
+                {"type": "message", "role": "assistant", "content": "world"},
+            ),
+        ]
+        mock_session.get_items.return_value = items
+
+        mock_compact_response = MagicMock()
+        mock_compact_response.output = []
+
+        mock_client = MagicMock()
+        mock_client.responses.compact = AsyncMock(return_value=mock_compact_response)
+
+        session = OpenAIResponsesCompactionSession(
+            session_id="test",
+            underlying_session=mock_session,
+            client=mock_client,
+            compaction_mode="auto",
+        )
+
+        await session.run_compaction({"response_id": "resp-auto", "store": False, "force": True})
+        await session.run_compaction({"response_id": "resp-stored", "force": True})
+
+        assert mock_client.responses.compact.call_count == 2
+        first_kwargs = mock_client.responses.compact.call_args_list[0].kwargs
+        second_kwargs = mock_client.responses.compact.call_args_list[1].kwargs
+        assert "previous_response_id" not in first_kwargs
+        assert second_kwargs.get("previous_response_id") == "resp-stored"
+        assert "input" not in second_kwargs
+
+    @pytest.mark.asyncio
+    async def test_run_compaction_auto_uses_input_when_last_response_unstored(self) -> None:
+        mock_session = self.create_mock_session()
+        items: list[TResponseInputItem] = [
+            cast(TResponseInputItem, {"type": "message", "role": "user", "content": "hello"}),
+            cast(
+                TResponseInputItem,
+                {"type": "message", "role": "assistant", "content": "world"},
+            ),
+        ]
+        mock_session.get_items.return_value = items
+
+        mock_compact_response = MagicMock()
+        mock_compact_response.output = [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": "compacted",
+            }
+        ]
+
+        mock_client = MagicMock()
+        mock_client.responses.compact = AsyncMock(return_value=mock_compact_response)
+
+        session = OpenAIResponsesCompactionSession(
+            session_id="test",
+            underlying_session=mock_session,
+            client=mock_client,
+            compaction_mode="auto",
+        )
+
+        await session.run_compaction(
+            {"response_id": "resp-unstored", "store": False, "force": True}
+        )
+        await session.run_compaction({"force": True})
+
+        assert mock_client.responses.compact.call_count == 2
+        first_kwargs = mock_client.responses.compact.call_args_list[0].kwargs
+        second_kwargs = mock_client.responses.compact.call_args_list[1].kwargs
+        assert "previous_response_id" not in first_kwargs
+        assert "previous_response_id" not in second_kwargs
+        assert second_kwargs.get("input") == mock_compact_response.output
 
     @pytest.mark.asyncio
     async def test_run_compaction_skips_when_below_threshold(self) -> None:
@@ -288,6 +466,151 @@ class TestOpenAIResponsesCompactionSession:
         mock_client.responses.compact.assert_awaited_once()
         items = await session.get_items()
         assert any(isinstance(item, dict) and item.get("type") == "compaction" for item in items)
+
+    @pytest.mark.asyncio
+    async def test_compaction_skips_when_tool_outputs_present(self) -> None:
+        underlying = SimpleListSession()
+        mock_client = MagicMock()
+        mock_client.responses.compact = AsyncMock()
+
+        session = OpenAIResponsesCompactionSession(
+            session_id="demo",
+            underlying_session=underlying,
+            client=mock_client,
+            should_trigger_compaction=lambda ctx: True,
+        )
+
+        tool = get_function_tool(name="do_thing", return_value="done")
+        model = FakeModel(initial_output=[get_function_tool_call("do_thing")])
+        agent = Agent(
+            name="assistant",
+            model=model,
+            tools=[tool],
+            tool_use_behavior="stop_on_first_tool",
+        )
+
+        await Runner.run(agent, "hello", session=session)
+
+        mock_client.responses.compact.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_deferred_compaction_includes_compaction_mode_in_context(self) -> None:
+        underlying = SimpleListSession()
+        mock_client = MagicMock()
+        mock_client.responses.compact = AsyncMock()
+        observed = {}
+
+        def should_trigger_compaction(context: dict[str, Any]) -> bool:
+            observed["mode"] = context["compaction_mode"]
+            return False
+
+        session = OpenAIResponsesCompactionSession(
+            session_id="demo",
+            underlying_session=underlying,
+            client=mock_client,
+            compaction_mode="input",
+            should_trigger_compaction=should_trigger_compaction,
+        )
+
+        tool = get_function_tool(name="do_thing", return_value="done")
+        model = FakeModel(initial_output=[get_function_tool_call("do_thing")])
+        agent = Agent(
+            name="assistant",
+            model=model,
+            tools=[tool],
+            tool_use_behavior="stop_on_first_tool",
+        )
+
+        await Runner.run(agent, "hello", session=session)
+
+        assert observed["mode"] == "input"
+        mock_client.responses.compact.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_compaction_runs_after_deferred_tool_outputs_when_due(self) -> None:
+        underlying = SimpleListSession()
+        compacted = SimpleNamespace(
+            output=[{"type": "compaction", "summary": "compacted"}],
+        )
+        mock_client = MagicMock()
+        mock_client.responses.compact = AsyncMock(return_value=compacted)
+
+        def should_trigger_compaction(context: dict[str, Any]) -> bool:
+            return any(
+                isinstance(item, dict) and item.get("type") == "function_call_output"
+                for item in context["session_items"]
+            )
+
+        session = OpenAIResponsesCompactionSession(
+            session_id="demo",
+            underlying_session=underlying,
+            client=mock_client,
+            should_trigger_compaction=should_trigger_compaction,
+        )
+
+        tool = get_function_tool(name="do_thing", return_value="done")
+        model = FakeModel()
+        model.add_multiple_turn_outputs(
+            [
+                [get_function_tool_call("do_thing")],
+                [get_text_message("ok")],
+            ]
+        )
+        agent = Agent(
+            name="assistant",
+            model=model,
+            tools=[tool],
+            tool_use_behavior="stop_on_first_tool",
+        )
+
+        await Runner.run(agent, "hello", session=session)
+        await Runner.run(agent, "followup", session=session)
+
+        mock_client.responses.compact.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_deferred_compaction_persists_across_tool_turns(self) -> None:
+        underlying = SimpleListSession()
+        compacted = SimpleNamespace(
+            output=[{"type": "compaction", "summary": "compacted"}],
+        )
+        mock_client = MagicMock()
+        mock_client.responses.compact = AsyncMock(return_value=compacted)
+
+        should_compact_calls = {"count": 0}
+
+        def should_trigger_compaction(context: dict[str, Any]) -> bool:
+            should_compact_calls["count"] += 1
+            return should_compact_calls["count"] == 1
+
+        session = OpenAIResponsesCompactionSession(
+            session_id="demo",
+            underlying_session=underlying,
+            client=mock_client,
+            should_trigger_compaction=should_trigger_compaction,
+        )
+
+        tool = get_function_tool(name="do_thing", return_value="done")
+        model = FakeModel()
+        model.add_multiple_turn_outputs(
+            [
+                [get_function_tool_call("do_thing")],
+                [get_function_tool_call("do_thing")],
+                [get_text_message("ok")],
+            ]
+        )
+        agent = Agent(
+            name="assistant",
+            model=model,
+            tools=[tool],
+            tool_use_behavior="stop_on_first_tool",
+        )
+
+        await Runner.run(agent, "hello", session=session)
+        await Runner.run(agent, "again", session=session)
+        await Runner.run(agent, "final", session=session)
+
+        mock_client.responses.compact.assert_awaited_once()
 
 
 class TestTypeGuard:

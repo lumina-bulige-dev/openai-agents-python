@@ -4,10 +4,11 @@ The Agents SDK includes built-in tracing, collecting a comprehensive record of e
 
 !!!note
 
-    Tracing is enabled by default. There are two ways to disable tracing:
+    Tracing is enabled by default. You can disable it in three common ways:
 
     1. You can globally disable tracing by setting the env var `OPENAI_AGENTS_DISABLE_TRACING=1`
-    2. You can disable tracing for a single run by setting [`agents.run.RunConfig.tracing_disabled`][] to `True`
+    2. You can globally disable tracing in code with [`set_tracing_disabled(True)`][agents.set_tracing_disabled]
+    3. You can disable tracing for a single run by setting [`agents.run.RunConfig.tracing_disabled`][] to `True`
 
 ***For organizations operating under a Zero Data Retention (ZDR) policy using OpenAI's APIs, tracing is unavailable.***
 
@@ -100,7 +101,7 @@ To customize this default setup, to send traces to alternative or additional bac
 2. [`set_trace_processors()`][agents.tracing.set_trace_processors] lets you **replace** the default processors with your own trace processors. This means traces will not be sent to the OpenAI backend unless you include a `TracingProcessor` that does so.
 
 
-## Tracing with Non-OpenAI Models
+## Tracing with non-OpenAI models
 
 You can use an OpenAI API key with non-OpenAI Models to enable free tracing in the OpenAI Traces dashboard without needing to disable tracing.
 
@@ -135,11 +136,15 @@ await Runner.run(
 )
 ```
 
-## Notes
+## Additional notes
 - View free traces at Openai Traces dashboard.
 
 
-## External tracing processors list
+## Ecosystem integrations
+
+The following community and vendor integrations support the OpenAI Agents SDK tracing surface.
+
+### External tracing processors list
 
 -   [Weights & Biases](https://weave-docs.wandb.ai/guides/integrations/openai_agents)
 -   [Arize-Phoenix](https://docs.arize.com/phoenix/tracing/integrations-tracing/openai-agents-sdk)
@@ -161,3 +166,5 @@ await Runner.run(
 -   [Portkey AI](https://portkey.ai/docs/integrations/agents/openai-agents)
 -   [LangDB AI](https://docs.langdb.ai/getting-started/working-with-agent-frameworks/working-with-openai-agents-sdk)
 -   [Agenta](https://docs.agenta.ai/observability/integrations/openai-agents)
+-   [PostHog](https://posthog.com/docs/llm-analytics/installation/openai-agents)
+-   [Traccia](https://traccia.ai/docs/integrations/openai-agents)

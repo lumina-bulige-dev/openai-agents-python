@@ -4,31 +4,58 @@ search:
 ---
 # モデル
 
-Agents SDK には、すぐに使える 2 種類の OpenAI モデル対応が含まれています:
+Agents SDK には、OpenAI モデルをすぐに使える形で 2 つの方式でサポートしています。
 
--   **推奨**: 新しい [Responses API](https://platform.openai.com/docs/api-reference/responses) を使って OpenAI API を呼び出す [`OpenAIResponsesModel`][agents.models.openai_responses.OpenAIResponsesModel]
--   [Chat Completions API](https://platform.openai.com/docs/api-reference/chat) を使って OpenAI API を呼び出す [`OpenAIChatCompletionsModel`][agents.models.openai_chatcompletions.OpenAIChatCompletionsModel]
+-   **推奨**: 新しい [Responses API](https://platform.openai.com/docs/api-reference/responses) を使って OpenAI API を呼び出す [`OpenAIResponsesModel`][agents.models.openai_responses.OpenAIResponsesModel]。
+-   [Chat Completions API](https://platform.openai.com/docs/api-reference/chat) を使って OpenAI API を呼び出す [`OpenAIChatCompletionsModel`][agents.models.openai_chatcompletions.OpenAIChatCompletionsModel]。
+
+## モデル設定の選択
+
+設定に応じて、次の順序でこのページをご利用ください。
+
+| 目的 | 開始場所 |
+| --- | --- |
+| SDK のデフォルトで OpenAI ホストモデルを使う | [OpenAI モデル](#openai-models) |
+| websocket トランスポートで OpenAI Responses API を使う | [Responses WebSocket トランスポート](#responses-websocket-transport) |
+| OpenAI 以外のプロバイダーを使う | [非 OpenAI モデル](#non-openai-models) |
+| 1 つのワークフローでモデル / プロバイダーを混在させる | [高度なモデル選択と混在](#advanced-model-selection-and-mixing) と [プロバイダー間でのモデル混在](#mixing-models-across-providers) |
+| プロバイダー互換性の問題をデバッグする | [非 OpenAI プロバイダーのトラブルシューティング](#troubleshooting-non-openai-providers) |
 
 ## OpenAI モデル
 
-`Agent` を初期化する際にモデルを指定しない場合、デフォルトのモデルが使用されます。現在のデフォルトは互換性と低レイテンシのために [`gpt-4.1`](https://platform.openai.com/docs/models/gpt-4.1) です。アクセス権がある場合は、明示的な `model_settings` を維持しながら、より高品質のために エージェント を [`gpt-5.2`](https://platform.openai.com/docs/models/gpt-5.2) に設定することを推奨します。
+`Agent` の初期化時にモデルを指定しない場合、デフォルトモデルが使われます。現在のデフォルトは、互換性と低レイテンシのため [`gpt-4.1`](https://platform.openai.com/docs/models/gpt-4.1) です。アクセス可能であれば、明示的な `model_settings` を維持しつつ、より高品質な [`gpt-5.2`](https://platform.openai.com/docs/models/gpt-5.2) にエージェントを設定することを推奨します。
 
-[`gpt-5.2`](https://platform.openai.com/docs/models/gpt-5.2) のような他のモデルに切り替えたい場合は、次のセクションの手順に従ってください。
+[`gpt-5.2`](https://platform.openai.com/docs/models/gpt-5.2) のような他モデルに切り替えるには、エージェントを設定する方法が 2 つあります。
 
-### 既定の OpenAI モデル
+### デフォルトモデル
 
-カスタムモデルを設定していないすべての エージェント で特定のモデルを一貫して使用したい場合は、エージェント を実行する前に環境変数 `OPENAI_DEFAULT_MODEL` を設定してください。
+まず、カスタムモデルを設定していないすべてのエージェントで一貫して特定モデルを使いたい場合は、エージェント実行前に `OPENAI_DEFAULT_MODEL` 環境変数を設定します。
 
 ```bash
-export OPENAI_DEFAULT_MODEL=gpt-5
+export OPENAI_DEFAULT_MODEL=gpt-5.2
 python3 my_awesome_agent.py
 ```
 
-#### GPT-5 モデル
+次に、`RunConfig` 経由で実行ごとのデフォルトモデルを設定できます。エージェントにモデルを設定しない場合は、この実行のモデルが使われます。
 
-この方法で GPT-5 のいずれかの推論モデル（[`gpt-5`](https://platform.openai.com/docs/models/gpt-5)、[`gpt-5-mini`](https://platform.openai.com/docs/models/gpt-5-mini)、または [`gpt-5-nano`](https://platform.openai.com/docs/models/gpt-5-nano)）を使用する場合、SDK は既定で妥当な `ModelSettings` を適用します。具体的には、`reasoning.effort` と `verbosity` の両方を `"low"` に設定します。これらの設定を自分で構築したい場合は、`agents.models.get_default_model_settings("gpt-5")` を呼び出してください。
+```python
+from agents import Agent, RunConfig, Runner
 
-より低レイテンシや特定の要件がある場合は、別のモデルと設定を選択できます。デフォルトモデルの推論努力度を調整するには、独自の `ModelSettings` を渡してください:
+agent = Agent(
+    name="Assistant",
+    instructions="You're a helpful agent.",
+)
+
+result = await Runner.run(
+    agent,
+    "Hello",
+    run_config=RunConfig(model="gpt-5.2"),
+)
+```
+
+#### GPT-5.x モデル
+
+この方法で [`gpt-5.2`](https://platform.openai.com/docs/models/gpt-5.2) などの GPT-5.x モデルを使う場合、SDK はデフォルトの `ModelSettings` を適用します。これはほとんどのユースケースで最適に動作する設定です。デフォルトモデルの推論負荷を調整するには、独自の `ModelSettings` を渡してください。
 
 ```python
 from openai.types.shared import Reasoning
@@ -37,59 +64,102 @@ from agents import Agent, ModelSettings
 my_agent = Agent(
     name="My Agent",
     instructions="You're a helpful agent.",
-    model_settings=ModelSettings(reasoning=Reasoning(effort="minimal"), verbosity="low")
-    # If OPENAI_DEFAULT_MODEL=gpt-5 is set, passing only model_settings works.
-    # It's also fine to pass a GPT-5 model name explicitly:
-    # model="gpt-5",
+    # If OPENAI_DEFAULT_MODEL=gpt-5.2 is set, passing only model_settings works.
+    # It's also fine to pass a GPT-5.x model name explicitly:
+    model="gpt-5.2",
+    model_settings=ModelSettings(reasoning=Reasoning(effort="high"), verbosity="low")
 )
 ```
 
-特に低レイテンシを重視する場合、[`gpt-5-mini`](https://platform.openai.com/docs/models/gpt-5-mini) または [`gpt-5-nano`](https://platform.openai.com/docs/models/gpt-5-nano) に `reasoning.effort="minimal"` を組み合わせると、デフォルト設定よりも高速に応答が返ることがよくあります。ただし、Responses API における一部の組み込みツール（ファイル検索や画像生成など）は `"minimal"` の推論努力度をサポートしていないため、本 Agents SDK のデフォルトは `"low"` になっています。
+低レイテンシのためには、`gpt-5.2` で `reasoning.effort="none"` を使うことを推奨します。gpt-4.1 ファミリー（ mini および nano バリアントを含む）も、対話型エージェントアプリ構築における有力な選択肢です。
 
 #### 非 GPT-5 モデル
 
-カスタムの `model_settings` なしで GPT-5 以外のモデル名を渡すと、SDK はあらゆるモデルと互換性のある汎用的な `ModelSettings` にフォールバックします。
+カスタム `model_settings` なしで非 GPT-5 モデル名を渡すと、SDK は任意モデルと互換性のある汎用 `ModelSettings` に戻します。
+
+### Responses WebSocket トランスポート
+
+デフォルトでは、OpenAI Responses API リクエストは HTTP トランスポートを使います。OpenAI バックエンドのモデルを使う場合、websocket トランスポートを有効化できます。
+
+```python
+from agents import set_default_openai_responses_transport
+
+set_default_openai_responses_transport("websocket")
+```
+
+これは、デフォルトの OpenAI プロバイダーで解決される OpenAI Responses モデル（`"gpt-5.2"` のような文字列モデル名を含む）に影響します。
+
+トランスポート選択は、SDK がモデル名をモデルインスタンスに解決する際に行われます。具体的な [`Model`][agents.models.interface.Model] オブジェクトを渡した場合、そのトランスポートはすでに固定されています。[`OpenAIResponsesWSModel`][agents.models.openai_responses.OpenAIResponsesWSModel] は websocket、[`OpenAIResponsesModel`][agents.models.openai_responses.OpenAIResponsesModel] は HTTP、[`OpenAIChatCompletionsModel`][agents.models.openai_chatcompletions.OpenAIChatCompletionsModel] は Chat Completions のままです。`RunConfig(model_provider=...)` を渡した場合は、グローバルデフォルトではなくそのプロバイダーがトランスポート選択を制御します。
+
+websocket トランスポートは、プロバイダー単位または実行単位でも設定できます。
+
+```python
+from agents import Agent, OpenAIProvider, RunConfig, Runner
+
+provider = OpenAIProvider(
+    use_responses_websocket=True,
+    # Optional; if omitted, OPENAI_WEBSOCKET_BASE_URL is used when set.
+    websocket_base_url="wss://your-proxy.example/v1",
+)
+
+agent = Agent(name="Assistant")
+result = await Runner.run(
+    agent,
+    "Hello",
+    run_config=RunConfig(model_provider=provider),
+)
+```
+
+プレフィックスベースのモデルルーティング（例: 1 回の実行で `openai/...` と `litellm/...` のモデル名を混在）を使う必要がある場合は、代わりに [`MultiProvider`][agents.MultiProvider] を使い、そこで `openai_use_responses_websocket=True` を設定してください。
+
+カスタムの OpenAI 互換エンドポイントまたはプロキシを使う場合、websocket トランスポートには互換性のある websocket `/responses` エンドポイントも必要です。そのような構成では、`websocket_base_url` を明示的に設定する必要がある場合があります。
+
+注意:
+
+-   これは websocket トランスポート上の Responses API であり、[Realtime API](../realtime/guide.md) ではありません。Chat Completions や非 OpenAI プロバイダーには、Responses websocket `/responses` エンドポイントをサポートしていない限り適用されません。
+-   環境で未導入の場合は、`websockets` パッケージをインストールしてください。
+-   websocket トランスポート有効化後は、[`Runner.run_streamed()`][agents.run.Runner.run_streamed] を直接使えます。複数ターンのワークフローで同じ websocket 接続をターン間（およびネストした Agents-as-tools 呼び出し間）で再利用したい場合は、[`responses_websocket_session()`][agents.responses_websocket_session] ヘルパーの利用を推奨します。[エージェント実行](../running_agents.md) ガイドと [`examples/basic/stream_ws.py`](https://github.com/openai/openai-agents-python/tree/main/examples/basic/stream_ws.py) を参照してください。
 
 ## 非 OpenAI モデル
 
-[LiteLLM 連携](./litellm.md)を通じて、ほとんどの他社製（非 OpenAI）モデルを使用できます。まず、litellm の依存関係グループをインストールします:
+ほとんどの非 OpenAI モデルは、[LiteLLM 統合](./litellm.md) 経由で利用できます。まず、litellm 依存関係グループをインストールしてください。
 
 ```bash
 pip install "openai-agents[litellm]"
 ```
 
-次に、`litellm/` プレフィックスを付けて、[サポートされているモデル](https://docs.litellm.ai/docs/providers) を利用します:
+次に、`litellm/` プレフィックス付きで任意の[対応モデル](https://docs.litellm.ai/docs/providers)を使います。
 
 ```python
 claude_agent = Agent(model="litellm/anthropic/claude-3-5-sonnet-20240620", ...)
 gemini_agent = Agent(model="litellm/gemini/gemini-2.5-flash-preview-04-17", ...)
 ```
 
-### 非 OpenAI モデルの他の利用方法
+### 非 OpenAI モデルを使うその他の方法
 
-他の LLM プロバイダーはさらに 3 つの方法で統合できます（code examples は[こちら](https://github.com/openai/openai-agents-python/tree/main/examples/model_providers/)）:
+他の LLM プロバイダーは、さらに 3 つの方法で統合できます（コード例は[こちら](https://github.com/openai/openai-agents-python/tree/main/examples/model_providers/)）。
 
-1. [`set_default_openai_client`][agents.set_default_openai_client] は、LLM クライアントとして `AsyncOpenAI` のインスタンスをグローバルに使用したい場合に便利です。これは LLM プロバイダーが OpenAI 互換の API エンドポイントを提供し、`base_url` と `api_key` を設定できるケース向けです。設定可能な例は [examples/model_providers/custom_example_global.py](https://github.com/openai/openai-agents-python/tree/main/examples/model_providers/custom_example_global.py) を参照してください。
-2. [`ModelProvider`][agents.models.interface.ModelProvider] は `Runner.run` レベルです。これにより、「この実行のすべての エージェント にカスタムモデルプロバイダーを使う」と指定できます。設定可能な例は [examples/model_providers/custom_example_provider.py](https://github.com/openai/openai-agents-python/tree/main/examples/model_providers/custom_example_provider.py) を参照してください。
-3. [`Agent.model`][agents.agent.Agent.model] は、特定の Agent インスタンスでモデルを指定できます。これにより、エージェント ごとに異なるプロバイダーを組み合わせて利用できます。設定可能な例は [examples/model_providers/custom_example_agent.py](https://github.com/openai/openai-agents-python/tree/main/examples/model_providers/custom_example_agent.py) を参照してください。最も多くの利用可能モデルを簡単に使う方法は [LiteLLM 連携](./litellm.md) です。
+1. [`set_default_openai_client`][agents.set_default_openai_client] は、`AsyncOpenAI` のインスタンスを LLM クライアントとしてグローバルに使いたい場合に有用です。これは、LLM プロバイダーが OpenAI 互換 API エンドポイントを持ち、`base_url` と `api_key` を設定できるケース向けです。設定可能なコード例は [examples/model_providers/custom_example_global.py](https://github.com/openai/openai-agents-python/tree/main/examples/model_providers/custom_example_global.py) を参照してください。
+2. [`ModelProvider`][agents.models.interface.ModelProvider] は `Runner.run` レベルです。これにより、「この実行のすべてのエージェントにカスタムモデルプロバイダーを使う」と指定できます。設定可能なコード例は [examples/model_providers/custom_example_provider.py](https://github.com/openai/openai-agents-python/tree/main/examples/model_providers/custom_example_provider.py) を参照してください。
+3. [`Agent.model`][agents.agent.Agent.model] では、特定の Agent インスタンスに対してモデルを指定できます。これにより、エージェントごとに異なるプロバイダーを組み合わせられます。設定可能なコード例は [examples/model_providers/custom_example_agent.py](https://github.com/openai/openai-agents-python/tree/main/examples/model_providers/custom_example_agent.py) を参照してください。利用可能な多くのモデルを簡単に使う方法として、[LiteLLM 統合](./litellm.md) があります。
 
-`platform.openai.com` の API キーをお持ちでない場合は、`set_tracing_disabled()` で トレーシング を無効化するか、[別のトレーシング プロセッサー](../tracing.md) を設定することを推奨します。
+`platform.openai.com` の API キーを持っていない場合は、`set_tracing_disabled()` でトレーシングを無効化するか、[別のトレーシングプロセッサー](../tracing.md) を設定することを推奨します。
 
 !!! note
 
-    これらの例では、多くの LLM プロバイダーがまだ Responses API をサポートしていないため、Chat Completions API/モデルを使用しています。LLM プロバイダーが Responses をサポートしている場合は、Responses の使用を推奨します。
+    これらのコード例では、ほとんどの LLM プロバイダーがまだ Responses API をサポートしていないため、Chat Completions API / モデルを使っています。LLM プロバイダーが対応している場合は、Responses の利用を推奨します。
 
-## モデルの組み合わせ
+## 高度なモデル選択と混在
 
-単一のワークフロー内で、エージェント ごとに異なるモデルを使いたい場合があります。たとえば、振り分けには小さく高速なモデルを使用し、複雑なタスクにはより大きく高性能なモデルを使用できます。[`Agent`][agents.Agent] を構成する際、次のいずれかで特定のモデルを選択できます:
+単一ワークフロー内で、エージェントごとに異なるモデルを使いたい場合があります。たとえば、トリアージには小型で高速なモデルを使い、複雑なタスクにはより大型で高性能なモデルを使えます。[`Agent`][agents.Agent] を設定する際は、次のいずれかで特定モデルを選択できます。
 
 1. モデル名を渡す。
 2. 任意のモデル名 + その名前を Model インスタンスにマッピングできる [`ModelProvider`][agents.models.interface.ModelProvider] を渡す。
-3. 直接 [`Model`][agents.models.interface.Model] 実装を提供する。
+3. [`Model`][agents.models.interface.Model] 実装を直接渡す。
 
 !!!note
 
-    SDK は [`OpenAIResponsesModel`][agents.models.openai_responses.OpenAIResponsesModel] と [`OpenAIChatCompletionsModel`][agents.models.openai_chatcompletions.OpenAIChatCompletionsModel] の両方の形状をサポートしますが、それぞれサポートする機能やツールのセットが異なるため、ワークフローごとに単一のモデル形状を使用することを推奨します。ワークフローでモデル形状を混在させる必要がある場合は、使用しているすべての機能が両方で利用可能であることを確認してください。
+    SDK は [`OpenAIResponsesModel`][agents.models.openai_responses.OpenAIResponsesModel] と [`OpenAIChatCompletionsModel`][agents.models.openai_chatcompletions.OpenAIChatCompletionsModel] の両方の形式をサポートしますが、2 つはサポートする機能とツールのセットが異なるため、ワークフローごとに単一のモデル形式を使うことを推奨します。ワークフローでモデル形式を混在させる必要がある場合は、使用するすべての機能が両方で利用可能であることを確認してください。
 
 ```python
 from agents import Agent, Runner, AsyncOpenAI, OpenAIChatCompletionsModel
@@ -122,10 +192,10 @@ async def main():
     print(result.final_output)
 ```
 
-1.  OpenAI のモデル名を直接設定します。
+1.  OpenAI モデル名を直接設定します。
 2.  [`Model`][agents.models.interface.Model] 実装を提供します。
 
-エージェント で使用するモデルをさらに構成したい場合は、温度などのオプションのモデル構成パラメーターを提供する [`ModelSettings`][agents.models.interface.ModelSettings] を渡せます。
+エージェントで使うモデルをさらに設定したい場合は、temperature などの任意のモデル設定パラメーターを提供する [`ModelSettings`][agents.models.interface.ModelSettings] を渡せます。
 
 ```python
 from agents import Agent, ModelSettings
@@ -138,7 +208,37 @@ english_agent = Agent(
 )
 ```
 
-また、OpenAI の Responses API を使用する場合、[他にもいくつかのオプションのパラメーター](https://platform.openai.com/docs/api-reference/responses/create)（例: `user`、`service_tier` など）があります。トップレベルで指定できない場合は、`extra_args` を使って渡すこともできます。
+#### 一般的な高度な `ModelSettings` オプション
+
+OpenAI Responses API を使っている場合、いくつかのリクエストフィールドにはすでに直接対応する `ModelSettings` フィールドがあるため、`extra_args` は不要です。
+
+| フィールド | 用途 |
+| --- | --- |
+| `parallel_tool_calls` | 同一ターン内で複数のツール呼び出しを許可または禁止します。 |
+| `truncation` | コンテキスト超過時に失敗する代わりに、Responses API が最も古い会話項目を破棄できるよう `"auto"` を設定します。 |
+| `prompt_cache_retention` | たとえば `"24h"` のように、キャッシュされたプロンプトプレフィックスをより長く保持します。 |
+| `response_include` | `web_search_call.action.sources`、`file_search_call.results`、`reasoning.encrypted_content` など、より豊富なレスポンスペイロードを要求します。 |
+| `top_logprobs` | 出力テキストの上位トークン logprobs を要求します。SDK は `message.output_text.logprobs` も自動で追加します。 |
+
+```python
+from agents import Agent, ModelSettings
+
+research_agent = Agent(
+    name="Research agent",
+    model="gpt-5.2",
+    model_settings=ModelSettings(
+        parallel_tool_calls=False,
+        truncation="auto",
+        prompt_cache_retention="24h",
+        response_include=["web_search_call.action.sources"],
+        top_logprobs=5,
+    ),
+)
+```
+
+SDK がまだトップレベルで直接公開していない、プロバイダー固有または新しいリクエストフィールドが必要な場合に `extra_args` を使います。
+
+また、OpenAI の Responses API を使う場合、[他にもいくつかの任意パラメーター](https://platform.openai.com/docs/api-reference/responses/create)（例: `user`、`service_tier` など）があります。これらがトップレベルで利用できない場合も、`extra_args` で渡せます。
 
 ```python
 from agents import Agent, ModelSettings
@@ -154,26 +254,26 @@ english_agent = Agent(
 )
 ```
 
-## 他社製 LLM プロバイダー利用時の一般的な問題
+## 非 OpenAI プロバイダーのトラブルシューティング
 
-### トレーシング クライアントのエラー 401
+### トレーシングクライアントエラー 401
 
-トレーシング に関連するエラーが発生する場合、トレースは OpenAI サーバー にアップロードされ、OpenAI の API キーをお持ちでないことが原因です。解決策は次の 3 つです:
+トレーシング関連のエラーが出る場合、これはトレースが OpenAI サーバーにアップロードされる一方で OpenAI API キーを持っていないためです。解決方法は 3 つあります。
 
-1. トレーシング を完全に無効化する: [`set_tracing_disabled(True)`][agents.set_tracing_disabled]
-2. トレーシング 用に OpenAI キーを設定する: [`set_tracing_export_api_key(...)`][agents.set_tracing_export_api_key]。この API キーはトレースのアップロードのみに使用され、[platform.openai.com](https://platform.openai.com/) のものが必要です。
-3. 非 OpenAI のトレース プロセッサーを使用する。[tracing ドキュメント](../tracing.md#custom-tracing-processors) を参照してください。
+1. トレーシングを完全に無効化する: [`set_tracing_disabled(True)`][agents.set_tracing_disabled]。
+2. トレーシング用の OpenAI キーを設定する: [`set_tracing_export_api_key(...)`][agents.set_tracing_export_api_key]。この API キーはトレースのアップロードのみに使われ、[platform.openai.com](https://platform.openai.com/) 発行のものが必要です。
+3. 非 OpenAI のトレースプロセッサーを使う。[トレーシングドキュメント](../tracing.md#custom-tracing-processors)を参照してください。
 
-### Responses API のサポート
+### Responses API サポート
 
-SDK はデフォルトで Responses API を使用しますが、他の多くの LLM プロバイダーはまだサポートしていません。その結果、404 などの問題が発生することがあります。解決するには次の 2 つの方法があります:
+SDK はデフォルトで Responses API を使いますが、ほとんどの他 LLM プロバイダーはまだこれをサポートしていません。その結果、404 や類似の問題が発生することがあります。解決方法は 2 つあります。
 
 1. [`set_default_openai_api("chat_completions")`][agents.set_default_openai_api] を呼び出す。これは環境変数で `OPENAI_API_KEY` と `OPENAI_BASE_URL` を設定している場合に機能します。
-2. [`OpenAIChatCompletionsModel`][agents.models.openai_chatcompletions.OpenAIChatCompletionsModel] を使用する。code examples は[こちら](https://github.com/openai/openai-agents-python/tree/main/examples/model_providers/)にあります。
+2. [`OpenAIChatCompletionsModel`][agents.models.openai_chatcompletions.OpenAIChatCompletionsModel] を使う。コード例は [こちら](https://github.com/openai/openai-agents-python/tree/main/examples/model_providers/) です。
 
-### structured outputs のサポート
+### structured outputs サポート
 
-一部のモデルプロバイダーは [structured outputs](https://platform.openai.com/docs/guides/structured-outputs) をサポートしていません。これにより、次のようなエラーが発生することがあります:
+一部のモデルプロバイダーは [structured outputs](https://platform.openai.com/docs/guides/structured-outputs) をサポートしていません。これにより、次のようなエラーが発生する場合があります。
 
 ```
 
@@ -181,12 +281,12 @@ BadRequestError: Error code: 400 - {'error': {'message': "'response_format.type'
 
 ```
 
-これは一部のモデルプロバイダーの欠点で、JSON 出力はサポートしていても、出力に使用する `json_schema` を指定できないことがあります。現在この問題の修正に取り組んでいますが、JSON スキーマ出力をサポートしているプロバイダーに依存することを推奨します。そうでない場合、不正な JSON によりアプリが頻繁に壊れる可能性があります。
+これは一部モデルプロバイダーの制約です。JSON 出力はサポートしていても、出力に使用する `json_schema` を指定できません。現在修正に取り組んでいますが、JSON schema 出力をサポートするプロバイダーへの依存を推奨します。そうでない場合、不正な JSON によりアプリが頻繁に壊れる可能性があります。
 
-## プロバイダーをまたぐモデルの混在
+## プロバイダー間でのモデル混在
 
-モデルプロバイダー間の機能差異に注意しないと、エラーが発生する可能性があります。たとえば、OpenAI は structured outputs、マルチモーダル入力、ホスト型の ファイル検索 と Web 検索 をサポートしますが、多くの他社プロバイダーはこれらの機能をサポートしていません。次の制限に注意してください:
+モデルプロバイダー間の機能差を把握する必要があります。把握していないとエラーになる可能性があります。たとえば OpenAI は structured outputs、マルチモーダル入力、ホストされたファイル検索と Web 検索をサポートしますが、他の多くのプロバイダーはこれらをサポートしません。次の制約に注意してください。
 
--   サポートしていない `tools` を理解しないプロバイダーに送らない
--   テキストのみのモデルを呼び出す前に、マルチモーダル入力を除外する
--   structured JSON 出力をサポートしていないプロバイダーは無効な JSON を生成することがある点に注意する
+-   対応していないプロバイダーに未対応の `tools` を送らない
+-   テキスト専用モデルを呼び出す前にマルチモーダル入力を除外する
+-   structured JSON 出力をサポートしないプロバイダーは、ときどき無効な JSON を生成することを認識する

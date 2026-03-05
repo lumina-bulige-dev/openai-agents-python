@@ -13,20 +13,23 @@ from agents.prompts import Prompt
 from ..guardrail import OutputGuardrail
 from ..handoffs import Handoff
 from ..model_settings import ToolChoice
+from ..run_config import ToolErrorFormatter
 from ..tool import Tool
 
 RealtimeModelName: TypeAlias = Union[
     Literal[
         "gpt-realtime",
+        "gpt-realtime-1.5",
         "gpt-realtime-2025-08-28",
         "gpt-4o-realtime-preview",
-        "gpt-4o-mini-realtime-preview",
-        "gpt-4o-realtime-preview-2025-06-03",
-        "gpt-4o-realtime-preview-2024-12-17",
         "gpt-4o-realtime-preview-2024-10-01",
+        "gpt-4o-realtime-preview-2024-12-17",
+        "gpt-4o-realtime-preview-2025-06-03",
+        "gpt-4o-mini-realtime-preview",
         "gpt-4o-mini-realtime-preview-2024-12-17",
         "gpt-realtime-mini",
         "gpt-realtime-mini-2025-10-06",
+        "gpt-realtime-mini-2025-12-15",
     ],
     str,
 ]
@@ -98,6 +101,9 @@ class RealtimeTurnDetectionConfig(TypedDict):
 
     idle_timeout_ms: NotRequired[int]
     """Threshold for server-vad to trigger a response if the user is idle for this duration."""
+
+    model_version: NotRequired[str]
+    """Optional backend-specific VAD model identifier."""
 
 
 class RealtimeAudioInputConfig(TypedDict, total=False):
@@ -220,6 +226,9 @@ class RealtimeRunConfig(TypedDict):
 
     async_tool_calls: NotRequired[bool]
     """Whether function tool calls should run asynchronously. Defaults to True."""
+
+    tool_error_formatter: NotRequired[ToolErrorFormatter]
+    """Optional callback that formats tool error messages returned to the model."""
 
     # TODO (rm) Add history audio storage config
 
