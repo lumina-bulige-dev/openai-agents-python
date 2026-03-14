@@ -19,16 +19,16 @@ Use this page in the following order depending on your setup:
 
 ## OpenAI models
 
-When you don't specify a model when initializing an `Agent`, the default model will be used. The default is currently [`gpt-4.1`](https://platform.openai.com/docs/models/gpt-4.1) for compatibility and low latency. If you have access, we recommend setting your agents to [`gpt-5.2`](https://platform.openai.com/docs/models/gpt-5.2) for higher quality while keeping explicit `model_settings`.
+When you don't specify a model when initializing an `Agent`, the default model will be used. The default is currently [`gpt-4.1`](https://developers.openai.com/api/docs/models/gpt-4.1) for compatibility and low latency. If you have access, we recommend setting your agents to [`gpt-5.4`](https://developers.openai.com/api/docs/models/gpt-5.4) for higher quality while keeping explicit `model_settings`.
 
-If you want to switch to other models like [`gpt-5.2`](https://platform.openai.com/docs/models/gpt-5.2), there are two ways to configure your agents.
+If you want to switch to other models like [`gpt-5.4`](https://developers.openai.com/api/docs/models/gpt-5.4), there are two ways to configure your agents.
 
 ### Default model
 
 First, if you want to consistently use a specific model for all agents that do not set a custom model, set the `OPENAI_DEFAULT_MODEL` environment variable before running your agents.
 
 ```bash
-export OPENAI_DEFAULT_MODEL=gpt-5.2
+export OPENAI_DEFAULT_MODEL=gpt-5.4
 python3 my_awesome_agent.py
 ```
 
@@ -45,13 +45,13 @@ agent = Agent(
 result = await Runner.run(
     agent,
     "Hello",
-    run_config=RunConfig(model="gpt-5.2"),
+    run_config=RunConfig(model="gpt-5.4"),
 )
 ```
 
-#### GPT-5.x models
+#### GPT-5 models
 
-When you use any GPT-5.x model such as [`gpt-5.2`](https://platform.openai.com/docs/models/gpt-5.2) in this way, the SDK applies default `ModelSettings`. It sets the ones that work the best for most use cases. To adjust the reasoning effort for the default model, pass your own `ModelSettings`:
+When you use any GPT-5 model such as [`gpt-5.4`](https://developers.openai.com/api/docs/models/gpt-5.4) in this way, the SDK applies default `ModelSettings`. It sets the ones that work the best for most use cases. To adjust the reasoning effort for the default model, pass your own `ModelSettings`:
 
 ```python
 from openai.types.shared import Reasoning
@@ -60,14 +60,14 @@ from agents import Agent, ModelSettings
 my_agent = Agent(
     name="My Agent",
     instructions="You're a helpful agent.",
-    # If OPENAI_DEFAULT_MODEL=gpt-5.2 is set, passing only model_settings works.
-    # It's also fine to pass a GPT-5.x model name explicitly:
-    model="gpt-5.2",
+    # If OPENAI_DEFAULT_MODEL=gpt-5.4 is set, passing only model_settings works.
+    # It's also fine to pass a GPT-5 model name explicitly:
+    model="gpt-5.4",
     model_settings=ModelSettings(reasoning=Reasoning(effort="high"), verbosity="low")
 )
 ```
 
-For lower latency, using `reasoning.effort="none"` with `gpt-5.2` is recommended. The gpt-4.1 family (including mini and nano variants) also remains a solid choice for building interactive agent apps.
+For lower latency, using `reasoning.effort="none"` with `gpt-5.4` is recommended. The gpt-4.1 family (including mini and nano variants) also remains a solid choice for building interactive agent apps.
 
 #### Non-GPT-5 models
 
@@ -83,7 +83,7 @@ from agents import set_default_openai_responses_transport
 set_default_openai_responses_transport("websocket")
 ```
 
-This affects OpenAI Responses models resolved by the default OpenAI provider (including string model names such as `"gpt-5.2"`).
+This affects OpenAI Responses models resolved by the default OpenAI provider (including string model names such as `"gpt-5.4"`).
 
 Transport selection happens when the SDK resolves a model name into a model instance. If you pass a concrete [`Model`][agents.models.interface.Model] object, its transport is already fixed: [`OpenAIResponsesWSModel`][agents.models.openai_responses.OpenAIResponsesWSModel] uses websocket, [`OpenAIResponsesModel`][agents.models.openai_responses.OpenAIResponsesModel] uses HTTP, and [`OpenAIChatCompletionsModel`][agents.models.openai_chatcompletions.OpenAIChatCompletionsModel] stays on Chat Completions. If you pass `RunConfig(model_provider=...)`, that provider controls transport selection instead of the global default.
 
@@ -107,6 +107,39 @@ result = await Runner.run(
 ```
 
 If you need prefix-based model routing (for example mixing `openai/...` and `litellm/...` model names in one run), use [`MultiProvider`][agents.MultiProvider] and set `openai_use_responses_websocket=True` there instead.
+
+`MultiProvider` keeps two historical defaults:
+
+-   `openai/...` is treated as an alias for the OpenAI provider, so `openai/gpt-4.1` is routed as model `gpt-4.1`.
+-   Unknown prefixes raise `UserError` instead of being passed through.
+
+When you point the OpenAI provider at an OpenAI-compatible endpoint that expects literal namespaced model IDs, opt into the pass-through behavior explicitly. In websocket-enabled setups, keep `openai_use_responses_websocket=True` on the `MultiProvider` as well:
+
+```python
+from agents import Agent, MultiProvider, RunConfig, Runner
+
+provider = MultiProvider(
+    openai_base_url="https://openrouter.ai/api/v1",
+    openai_api_key="...",
+    openai_use_responses_websocket=True,
+    openai_prefix_mode="model_id",
+    unknown_prefix_mode="model_id",
+)
+
+agent = Agent(
+    name="Assistant",
+    instructions="Be concise.",
+    model="openai/gpt-4.1",
+)
+
+result = await Runner.run(
+    agent,
+    "Hello",
+    run_config=RunConfig(model_provider=provider),
+)
+```
+
+Use `openai_prefix_mode="model_id"` when a backend expects the literal `openai/...` string. Use `unknown_prefix_mode="model_id"` when the backend expects other namespaced model IDs such as `openrouter/openai/gpt-4.1-mini`. These options also work on `MultiProvider` outside websocket transport; this example keeps websocket enabled because it is part of the transport setup described in this section. The same options are also available on [`responses_websocket_session()`][agents.responses_websocket_session].
 
 If you use a custom OpenAI-compatible endpoint or proxy, websocket transport also requires a compatible websocket `/responses` endpoint. In those setups you may need to set `websocket_base_url` explicitly.
 
@@ -180,7 +213,7 @@ triage_agent = Agent(
     name="Triage agent",
     instructions="Handoff to the appropriate agent based on the language of the request.",
     handoffs=[spanish_agent, english_agent],
-    model="gpt-5",
+    model="gpt-5.4",
 )
 
 async def main():
@@ -221,7 +254,7 @@ from agents import Agent, ModelSettings
 
 research_agent = Agent(
     name="Research agent",
-    model="gpt-5.2",
+    model="gpt-5.4",
     model_settings=ModelSettings(
         parallel_tool_calls=False,
         truncation="auto",

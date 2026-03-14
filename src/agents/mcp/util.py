@@ -13,6 +13,11 @@ from typing_extensions import NotRequired, TypedDict
 
 from .. import _debug
 from ..exceptions import AgentsException, ModelBehaviorError, UserError
+
+try:
+    from mcp.shared.exceptions import McpError as _McpError
+except ImportError:  # pragma: no cover – mcp is optional on Python < 3.10
+    _McpError = None  # type: ignore[assignment, misc]
 from ..logger import logger
 from ..run_context import RunContextWrapper
 from ..strict_schema import ensure_strict_json_schema
@@ -360,6 +365,19 @@ class MCPUtil:
             # Re-raise UserError as-is (it already has a good message)
             raise
         except Exception as e:
+            if _McpError is not None and isinstance(e, _McpError):
+                # An MCP-level error (e.g. upstream HTTP 4xx/5xx, tool not found, etc.)
+                # is not a programming error – re-raise so the FunctionTool failure
+                # pipeline (failure_error_function) can handle it.  The default handler
+                # will surface the message as a structured error result; callers who set
+                # failure_error_function=None will have the error raised as documented.
+                error_text = e.error.message if hasattr(e, "error") and e.error else str(e)
+                logger.warning(
+                    f"MCP tool {tool.name} on server '{server.name}' returned an error: "
+                    f"{error_text}"
+                )
+                raise
+
             logger.error(f"Error invoking MCP tool {tool.name} on server '{server.name}': {e}")
             raise AgentsException(
                 f"Error invoking MCP tool {tool.name} on server '{server.name}': {e}"

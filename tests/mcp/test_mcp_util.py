@@ -193,6 +193,60 @@ async def test_mcp_invocation_crash_causes_error(caplog: pytest.LogCaptureFixtur
 
 
 @pytest.mark.asyncio
+async def test_mcp_invocation_mcp_error_reraises(caplog: pytest.LogCaptureFixture):
+    """Test that McpError from server.call_tool is re-raised so the FunctionTool failure
+    pipeline (failure_error_function) can handle it.
+
+    When an MCP server raises McpError (e.g. upstream HTTP 4xx/5xx), invoke_mcp_tool
+    re-raises so the configured failure_error_function shapes the model-visible error.
+    With the default failure_error_function the FunctionTool returns a string error
+    result; with failure_error_function=None the error is propagated to the caller.
+    """
+    caplog.set_level(logging.DEBUG)
+
+    from mcp.shared.exceptions import McpError
+    from mcp.types import ErrorData
+
+    class McpErrorFakeMCPServer(FakeMCPServer):
+        async def call_tool(
+            self,
+            tool_name: str,
+            arguments: dict[str, Any] | None,
+            meta: dict[str, Any] | None = None,
+        ):
+            raise McpError(ErrorData(code=-32000, message="upstream 422 Unprocessable Entity"))
+
+    server = McpErrorFakeMCPServer()
+    server.add_tool("search", {})
+
+    ctx = RunContextWrapper(context=None)
+    tool = MCPTool(name="search", inputSchema={})
+
+    # invoke_mcp_tool itself should re-raise McpError
+    with pytest.raises(McpError):
+        await MCPUtil.invoke_mcp_tool(server, tool, ctx, "{}")
+
+    # Warning (not error) should be logged before re-raising
+    assert "returned an error" in caplog.text
+
+    # Via FunctionTool with default failure_error_function: error becomes a string result
+    mcp_tool = MCPTool(name="search", inputSchema={})
+    agent = Agent(name="test-agent")
+    function_tool = MCPUtil.to_function_tool(
+        mcp_tool, server, convert_schemas_to_strict=False, agent=agent
+    )
+    tool_context = ToolContext(
+        context=None,
+        tool_name="search",
+        tool_call_id="test_call_mcp_error",
+        tool_arguments="{}",
+    )
+    result = await function_tool.on_invoke_tool(tool_context, "{}")
+    assert isinstance(result, str)
+    assert "upstream 422 Unprocessable Entity" in result or "error" in result.lower()
+
+
+@pytest.mark.asyncio
 async def test_mcp_tool_graceful_error_handling(caplog: pytest.LogCaptureFixture):
     """Test that MCP tool errors are handled gracefully when invoked via FunctionTool.
 
